@@ -1,0 +1,30 @@
+<%+header%>
+
+<% if message then %>
+    <div class="alert-message">
+        <script type="text/javascript">
+            alert("<%=message%>");
+        </script>
+    </div>
+<% end %>
+
+<script type="text/javascript">
+    document.addEventListener('DOMContentLoaded', function() {
+        var form = document.querySelector('form');
+        form.addEventListener('submit', function(event) {
+            event.preventDefault();
+            var formData = new FormData(form);
+            fetch(form.action, {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.text())
+            .then(html => {
+                document.body.innerHTML = html;
+            })
+            .catch(error => console.error('Error:', error));
+        });
+    });
+</script>
+
+<%+footer%>

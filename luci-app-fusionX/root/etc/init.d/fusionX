@@ -1,0 +1,219 @@
+#!/bin/sh /etc/rc.common
+clientname='test2'
+clientlicense='Default'
+clientloc='Default'
+START=99
+
+RX=0
+TX=0
+
+public_ip='0.0.0.0'
+
+INTERFACES="wwan0 wwan1 wwan2 lan1 lan2 lan3 wan"
+
+uci set fusionX.settings.is_monitoring='0'
+uci commit fusionX
+
+boot() {
+    chmod +x /etc/init.d/fusionX
+    /etc/init.d/fusionX enable
+    start
+}
+
+start(){
+    mac_address=$(cat /sys/class/net/eth0/address)
+    
+    uci set fusionX.settings.clientname="$mac_address"
+    
+    echo "Set clientname to MAC address: $mac_address"
+    
+    sleep 10
+    chmod +x /etc/init.d/fusionX
+    /etc/init.d/fusionX enable
+    client_name=$(uci get fusionX.settings.clientname)
+    activation_key=$(uci get fusionX.settings.activation_key)
+    new_ip=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"client\": \"$client_name\", \"license\": \"$activation_key\"}" http://102.132.169.58:4270/tempclientneg -m 5)
+    returned_ip=$(echo $new_ip | grep -o '"ip":"[^"]*"' | sed 's/"ip":"\(.*\)"/\1/')
+    returned_port=$(echo $new_ip | grep -o '"port":[0-9]*' | sed 's/"port":\(.*\)/\1/')
+    returned_license=$(echo $new_ip | grep -o '"license":"[^"]*"' | sed 's/"license":"\(.*\)"/\1/')
+    new_ip=$(echo $returned_ip | tr -d '"')
+    returned_port=$(echo $returned_port | tr -d '"')
+    returned_license=$(echo $returned_license | tr -d '"')
+    public_ip=$new_ip
+    if [ -n "$new_ip" ]; then
+        sed -i "s/\"address\": \".*\"/\"address\": \"$new_ip\"/" /etc/v2ray/config.json
+        sed -i "s/\"id\": \".*\"/\"id\": \"$returned_license\"/" /etc/v2ray/config.json
+        sed -i "s/\"port\": \".*\"/\"port\": \"$returned_port\"/" /etc/v2ray/config.json
+        logger -t fusionX "Updated V2Ray config with new IP: $new_ip"
+    else
+        logger -t fusionX "Failed to retrieve new IP from management server"
+    fi
+    sleep 5
+    
+    if echo "$public_ip" | grep -q "^102"; then
+        uci set fusionX.settings.bond_enabled='1'
+        uci set fusionX.settings.public_ip=$public_ip
+    else
+        uci set fusionX.settings.public_ip='0.0.0.0'
+    fi
+    if [ -f /root/proxy.nft ]; then
+        uci set fusionX.settings.bond_enabled='0'
+    fi
+    uci commit fusionX
+    /etc/init.d/v2ray restart
+    fw4 restart
+    echo "fusionX started" >> /etc/config/fusionXmon.txt
+    monitor_bandwidth &
+}
+
+disable() {
+    if [ -f /etc/nftables.d/proxy.nft ]; then
+        client_name=$(uci get fusionX.settings.clientname)
+        activation_key=$(uci get fusionX.settings.activation_key)
+        new_ip=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"client\": \"$client_name\", \"license\": \"$activation_key\"}" http://102.132.169.58:4270/tempclientneg -m 5)
+        returned_ip=$(echo $new_ip | grep -o '"ip":"[^"]*"' | sed 's/"ip":"\(.*\)"/\1/')
+        returned_port=$(echo $new_ip | grep -o '"port":[0-9]*' | sed 's/"port":\(.*\)/\1/')
+        returned_license=$(echo $new_ip | grep -o '"license":"[^"]*"' | sed 's/"license":"\(.*\)"/\1/')
+        new_ip=$(echo $returned_ip | tr -d '"')
+        returned_port=$(echo $returned_port | tr -d '"')
+        returned_license=$(echo $returned_license | tr -d '"')
+        public_ip=$new_ip
+        if [ -n "$new_ip" ]; then
+            sed -i "s/\"address\": \".*\"/\"address\": \"$new_ip\"/" /etc/v2ray/config.json
+            sed -i "s/\"id\": \".*\"/\"id\": \"$returned_license\"/" /etc/v2ray/config.json
+            sed -i "/\"vnext\": \[/,/\]/ s/\"port\": [0-9]*/\"port\": $returned_port/" /etc/v2ray/config.json
+            logger -t fusionX "Updated V2Ray config with new IP: $new_ip"
+        else
+            logger -t fusionX "Failed to retrieve new IP from management server"
+        fi
+        if echo "$public_ip" | grep -q "^102"; then
+            uci set fusionX.settings.bond_enabled='1'
+            uci set fusionX.settings.public_ip=$public_ip
+        else
+            uci set fusionX.settings.public_ip='0.0.0.0'
+        fi
+        if [ -f /root/proxy.nft ]; then
+            uci set fusionX.settings.bond_enabled='0'
+        fi
+        uci commit fusionX
+        /etc/init.d/v2ray restart
+        fw4 restart
+    else
+        mv /etc/nftables.d/proxy.nft /root/
+        fw4 restart
+    fi
+}
+startxms(){
+    sh /etc/init.d/xpexms.sh >/dev/null 2>&1 &
+}
+
+stopxms(){
+    pkill -f xpexms.sh
+}
+
+get_total_rx() {
+    total_rx=0
+    for iface in $INTERFACES; do
+        if [ -d "/sys/class/net/$iface" ]; then
+            iface_rx=$(cat /sys/class/net/$iface/statistics/rx_bytes)
+            total_rx=$((total_rx + iface_rx))
+        fi
+    done
+    echo $total_rx
+}
+
+get_total_tx() {
+    total_tx=0
+    for iface in $INTERFACES; do
+        if [ -d "/sys/class/net/$iface" ]; then
+            iface_tx=$(cat /sys/class/net/$iface/statistics/tx_bytes)
+            total_tx=$((total_tx + iface_tx))
+        fi
+    done
+    echo $total_tx
+}
+
+monitor_bandwidth() {
+    if [ "$(uci get fusionX.settings.is_monitoring)" -eq 1 ]; then
+        return
+    fi
+    uci set fusionX.settings.is_monitoring='1'
+    uci commit fusionX
+    while true; do
+        enabled=$(uci get fusionX.settings.bond_enabled)
+        if [ "$enabled" -eq 1 ]; then
+            RX_now=$(get_total_rx)
+            TX_now=$(get_total_tx)
+            TIMESTAMP_now=$(date +%s)
+
+            sleep 30
+
+            RX_next=$(get_total_rx)
+            TX_next=$(get_total_tx)
+            
+            RX_DIFF=$((RX_next - RX_now))
+            TX_DIFF=$((TX_next - TX_now))
+            TIME_DIFF=30
+            
+            RX_BW=$((RX_DIFF / TIME_DIFF))
+            TX_BW=$((TX_DIFF / TIME_DIFF))
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') RX: $RX_BW TX: $TX_BW" >> /etc/config/bandwidthusage.txt
+            if [ "$(uci get fusionX.settings.public_ip)" != "0.0.0.0" ] && [ -n "$(uci get fusionX.settings.clientname)" ] && [ "$(uci get fusionX.settings.clientname)" != "none" ]; then
+                curl -X POST -d "client=$(uci get fusionX.settings.clientname)&rx=$RX_BW&tx=$TX_BW" http://$public_ip:4269/clientinfo -m 5 > /dev/null 2>&1
+            else
+                echo "No public IP set" >> /etc/config/fusionXmon.txt
+            fi
+        fi
+    done
+}
+startstop() {
+    if [ "$(uci get fusionX.settings.xmsname)" != "none" ] && [ "$(uci get fusionX.settings.clientcomp)" != "none" ]; then
+        sh /etc/config/xpexms.sh >/dev/null 2>&1 &
+    fi
+    #for some fucking reason the bond_enabled option dissapears when the cbi checkbox is unchecked and the config file only updates after this logic has run so if the field exists then user just deactivated bond
+    if uci get fusionX.settings.bond_enabled >/dev/null 2>&1; then 
+        logger -t fusionX "stopping bonding..."
+        if [ -f /etc/nftables.d/proxy.nft ]; then
+            mv /etc/nftables.d/proxy.nft /root/
+            logger -t fusionX "File /etc/nftables.d/proxy.nft moved"
+        else
+            logger -t fusionX "File /etc/nftables.d/proxy.nft does not exist"
+        fi
+        fw4 restart
+    else
+        logger -t fusionX "Starting bonding..."
+        client_name=$(uci get fusionX.settings.clientname)
+        activation_key=$(uci get fusionX.settings.activation_key)
+        new_ip=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"client\": \"$client_name\", \"license\": \"$activation_key\"}" http://102.132.169.58:4270/tempclientneg -m 5)
+        returned_ip=$(echo $new_ip | grep -o '"ip":"[^"]*"' | sed 's/"ip":"\(.*\)"/\1/')
+        returned_port=$(echo $new_ip | grep -o '"port":[0-9]*' | sed 's/"port":\(.*\)/\1/')
+        returned_license=$(echo $new_ip | grep -o '"license":"[^"]*"' | sed 's/"license":"\(.*\)"/\1/')
+        new_ip=$(echo $returned_ip | tr -d '"')
+        returned_port=$(echo $returned_port | tr -d '"')
+        returned_license=$(echo $returned_license | tr -d '"')
+        public_ip=$new_ip
+        if [ -n "$new_ip" ]; then
+            sed -i "s/\"address\": \".*\"/\"address\": \"$new_ip\"/" /etc/v2ray/config.json
+            sed -i "s/\"id\": \".*\"/\"id\": \"$returned_license\"/" /etc/v2ray/config.json
+            sed -i "/\"vnext\": \[/,/\]/ s/\"port\": [0-9]*/\"port\": $returned_port/" /etc/v2ray/config.json
+            logger -t fusionX "Updated V2Ray config with new IP: $new_ip"
+            uci set fusionX.settings.public_ip=$public_ip
+            uci commit fusionX
+        else
+            logger -t fusionX "Failed to retrieve new IP from management server"
+        fi
+        if [ -f /root/proxy.nft ]; then
+            mv /root/proxy.nft /etc/nftables.d/
+            logger -t fusionX "File /root/proxy.nft moved"
+        else
+            logger -t fusionX "File /root/proxy.nft does not exist"
+        fi
+        /etc/init.d/v2ray restart
+        fw4 restart
+    fi
+}
+
+reload() {
+    startstop
+}
