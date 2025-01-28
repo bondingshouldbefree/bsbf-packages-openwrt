@@ -255,13 +255,6 @@ static void process_tun_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 	struct iphdr *new_ip = (struct iphdr *)encap_buffer;
 	struct udphdr *udp = (struct udphdr *)(encap_buffer + IP_HEADER_LEN);
 
-	// Get source IP from bound interface
-	struct in_addr src_addr;
-	if (get_interface_ip(config->bind_device, &src_addr) < 0) {
-		fprintf(stderr, "Failed to get interface IP\n");
-		return;
-	}
-
 	// Setup new IP header
 	memset(new_ip, 0, IP_HEADER_LEN);
 	new_ip->version = 4;
@@ -271,7 +264,7 @@ static void process_tun_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 	new_ip->id = htons(rand());
 	new_ip->ttl = 64;
 	new_ip->protocol = IPPROTO_UDP;
-	new_ip->saddr = src_addr.s_addr;
+	new_ip->saddr = 0;
 	new_ip->daddr = ip->daddr;
 
 	// Calculate IP header checksum
@@ -279,7 +272,7 @@ static void process_tun_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 	new_ip->check = ip_checksum(new_ip, IP_HEADER_LEN);
 
 	// Setup UDP header
-	udp->udp_source = htons(config->listen_port);
+	udp->udp_source = 0;
 	udp->udp_dest = htons(dport);
 	udp->udp_len = htons(len - IP_HEADER_LEN + UDP_HEADER_LEN);
 
