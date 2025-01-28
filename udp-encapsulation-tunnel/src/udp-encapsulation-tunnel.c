@@ -232,7 +232,7 @@ static void process_tun_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 	}
 
 	struct iphdr *ip = (struct iphdr *)buffer;
-	if (ip->protocol != IPPROTO_TCP) {
+	if (len < IP_HEADER_LEN || ip->protocol != IPPROTO_TCP) {
 		return; // Only process TCP packets
 	}
 
@@ -313,6 +313,8 @@ static void process_udp_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 	struct iphdr *ip = (struct iphdr *)buffer;
 	struct udphdr *udp = (struct udphdr *)(buffer + IP_HEADER_LEN);
 	struct tcphdr *tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN + UDP_HEADER_LEN);
+	if (len < TCP_HEADER_LEN)
+		return;
 
 	if (config->endpoint_port == 0) {
 		// Store the connection information (IPv4 saddr, UDP sport, TCP sport)
