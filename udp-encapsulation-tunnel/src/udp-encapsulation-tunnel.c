@@ -164,33 +164,35 @@ static uint16_t ip_checksum(void *vdata, size_t length) {
 }
 
 static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len) {
-	struct {
+	struct pseudo_header {
 		uint32_t source_address;
 		uint32_t dest_address;
 		uint8_t placeholder;
 		uint8_t protocol;
 		uint16_t tcp_length;
-	} pseudo_header;
+	};
+
+	struct {
+		struct pseudo_header hdr;
+		unsigned char tcp[BUFFER_SIZE];
+	} buffer;
 
 	// Fill pseudo header
-	pseudo_header.source_address = ip->saddr;
-	pseudo_header.dest_address = ip->daddr;
-	pseudo_header.placeholder = 0;
-	pseudo_header.protocol = IPPROTO_TCP;
-	pseudo_header.tcp_length = htons(len);
+	buffer.hdr.source_address = ip->saddr;
+	buffer.hdr.dest_address = ip->daddr;
+	buffer.hdr.placeholder = 0;
+	buffer.hdr.protocol = IPPROTO_TCP;
+	buffer.hdr.tcp_length = htons(len);
 
 	// Allocate memory for the calculation
-	int total_len = sizeof(pseudo_header) + len;
-	char *pseudogram = malloc(total_len); // TODO: use local buffer to avoid malloc + free here, e.g. simply use another including pseudo_header + a large buffer at the end
+	int total_len = sizeof(struct pseudo_header) + len;
 
 	// Copy pseudo header and TCP header + data
-	memcpy(pseudogram, &pseudo_header, sizeof(pseudo_header));
-	memcpy(pseudogram + sizeof(pseudo_header), tcp, len);
+	memcpy(&buffer.tcp, tcp, len);
 
 	// Calculate checksum
-	uint16_t checksum = ip_checksum(pseudogram, total_len);
+	uint16_t checksum = ip_checksum(&buffer, total_len);
 
-	free(pseudogram);
 	return checksum;
 }
 
