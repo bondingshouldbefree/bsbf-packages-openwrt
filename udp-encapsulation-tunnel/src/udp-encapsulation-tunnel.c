@@ -3,7 +3,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <net/if.h>
 #include <linux/if_tun.h>
 #include <sys/ioctl.h>
@@ -38,25 +37,30 @@
 #endif
 
 #define BUFFER_SIZE 2048
-#define IP_HEADER_LEN 20
+#define IP_HEADER_LEN 20  // TODO: can be more if there are options, check IHL
+                          // TODO: what about IPv6? IPv6 would be easier, no NAT...
 #define UDP_HEADER_LEN 8
-#define TCP_HEADER_LEN 20
+#define TCP_HEADER_LEN 20 // TODO: can be more if there are options, check len
 
 // Connection store entry structure - stores (IPv4 saddr, UDP sport, TCP sport)
-struct connection_store {
+struct connection_store {           // TODO: "source" in the comment + name + functions below is confusing, it depends on which direction you look. Client IP + port instead?
 	struct in_addr ip_saddr;    // Source IP address
 	uint16_t udp_sport;         // Source UDP port
 	uint16_t tcp_sport;         // Source TCP port
-	struct connection_store *next;
+	struct connection_store *next; // TODO: avoid using a list (O(n)), use a HashMap (O(1))
+	// TODO: store a timestamp: to be able to remove old entries, and handle conflicts: same IP + TCP port, but different UDP port
 };
 
 struct tunnel_config {
-	char device[IFNAMSIZ];
+	char device[IFNAMSIZ]; // TODO: typically called "interface" or "iface"?
 	uint16_t listen_port;
 	char bind_device[IFNAMSIZ];
-	uint16_t endpoint_port;
-	struct connection_store *store;
+	uint16_t endpoint_port; // TODO: typically called "destination_port" or "dport"?
+	struct connection_store *store; // TODO: avoid using a list (O(n)), use a HashMap (O(1))
 };
+
+// TODO: for the hashmap, we could have optimisations on the structure, because the number of clients (IP addr + UDP port) should be limited, while the number of TCP connections can be important.
+// We could then store a hashmap of IP address, and each one would have a hashmap of TCP ports. (A list of UDP ports could be used per IP address: if there is only one item, no need to find the corresponding TCP connection. But still needed to store them in case another client is added later)
 
 // Store connection information (IPv4 saddr, UDP sport, TCP sport)
 static void store_connection(struct tunnel_config *config, struct in_addr saddr, uint16_t udp_sport, uint16_t tcp_sport) {
@@ -65,8 +69,9 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 	// Check if entry already exists
 	while (current != NULL) {
 		if (current->ip_saddr.s_addr == saddr.s_addr &&
-			current->udp_sport == udp_sport &&
+			current->udp_sport == udp_sport && // TODO: if ADDR + TCP port match, but not UDP port, we have a conflict: check timestamp and either block the connection (e.g. different client behind the same IP), or replace (e.g. tunnel has been restarted) → we cannot predict that which one, seems safer to block
 			current->tcp_sport == tcp_sport) {
+			// TODO: Update timestamps here
 			return; // Entry already exists
 		}
 		current = current->next;
@@ -79,6 +84,7 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 	entry->tcp_sport = tcp_sport;
 	entry->next = config->store;
 	config->store = entry;
+	// TODO: we need a way to remove old entries based on a timestamp because an entry will be create for each TCP connection, so very likely thousands per minute / second on a busy server.
 }
 
 // Get stored UDP port for given IPv4 address and TCP port
@@ -175,7 +181,7 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len) {
 
 	// Allocate memory for the calculation
 	int total_len = sizeof(pseudo_header) + len;
-	char *pseudogram = malloc(total_len);
+	char *pseudogram = malloc(total_len); // TODO: use local buffer to avoid malloc + free here, e.g. simply use another including pseudo_header + a large buffer at the end
 
 	// Copy pseudo header and TCP header + data
 	memcpy(pseudogram, &pseudo_header, sizeof(pseudo_header));
@@ -236,6 +242,8 @@ static void process_tun_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 		return; // Only process TCP packets
 	}
 
+	// TODO: use len from ip->ihl and the size in byte should be >= IP_HEADER_LEN
+	// TODO: len should then be >= len(ip_hdr) + len(tcp_hdr), min 20 + 20
 	struct tcphdr *tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN);
 	struct in_addr daddr;
 	daddr.s_addr = ip->daddr;
@@ -243,11 +251,16 @@ static void process_tun_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 
 	// Determine destination UDP port based on endpoint_port or stored connection
 	if (config->endpoint_port == 0) {
+		// On the server side, no known dport: it cannot be predicted in
+		// case of CGNAT (multiple clients behind the same IPv4 -- would
+		// be simpler in IPv6 without NAT!), it needs to find it back
+		// from previous connections
 		dport = get_stored_port(config, daddr, ntohs(tcp->tcp_dest));
 		if (dport == 0) {
 			return; // No stored port and no endpoint port configured
 		}
 	} else {
+		// On the client side, the dport is known
 		dport = config->endpoint_port;
 	}
 
@@ -316,6 +329,8 @@ static void process_udp_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 	if (len < TCP_HEADER_LEN)
 		return;
 
+	// TODO: add some sanity checks, e.g. checking to see if the data in the buffer looks OK? e.g. checking if there are MPTCP options? Maybe something else?
+
 	if (config->endpoint_port == 0) {
 		// Store the connection information (IPv4 saddr, UDP sport, TCP sport)
 		struct in_addr src_addr_ip;
@@ -326,6 +341,7 @@ static void process_udp_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 	}
 
 	// Get tunnel interface IP address
+	// TODO: unlikely to change, do it only once in main()?
 	struct in_addr tun_addr;
 	if (get_interface_ip(config->device, &tun_addr) < 0) {
 		fprintf(stderr, "Failed to get tunnel interface IP\n");
@@ -357,6 +373,8 @@ static void process_udp_packet(int tun_fd, int udp_fd, struct tunnel_config *con
 		   len - IP_HEADER_LEN - UDP_HEADER_LEN);
 
 	// Calculate TCP checksum
+	// TODO: it should not be needed on the server side if the TUN address is the same as the public one.
+	//       (on the client side, we might not have the public IP)
 	struct tcphdr *new_tcp = (struct tcphdr *)(decap_buffer + IP_HEADER_LEN);
 	new_tcp->tcp_check = 0;
 	new_tcp->tcp_check = tcp_checksum(new_ip, new_tcp, len - IP_HEADER_LEN - UDP_HEADER_LEN);
@@ -372,10 +390,10 @@ int main(int argc, char *argv[]) {
 
 	// Parse command line arguments
 	static struct option long_options[] = {
-		{"device", required_argument, 0, 'd'},
+		{"device", required_argument, 0, 'd'}, // TODO: typically called "interface" | 'i'?
 		{"listen-port", required_argument, 0, 'l'},
 		{"bind-to-device", required_argument, 0, 'b'},
-		{"endpoint-port", required_argument, 0, 'e'},
+		{"endpoint-port", required_argument, 0, 'e'}, // TODO: typically called "destination-port" | 'd'?
 		{0, 0, 0, 0}
 	};
 
@@ -426,6 +444,8 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Bind UDP socket to listen port
+	// TODO: bind() should only be needed on the server side:
+	//       the client will initiate the connections
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
@@ -446,6 +466,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Main loop
+	// TODO: use multiple workers to be able to scale on a server with more than one core
 	fd_set readfds;
 	while (1) {
 		FD_ZERO(&readfds);
@@ -453,6 +474,7 @@ int main(int argc, char *argv[]) {
 		FD_SET(udp_fd, &readfds);
 		int maxfd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
 
+		// TODO: use io_uring if possible? (or at least epoll)
 		if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0) {
 			perror("select");
 			exit(1);
