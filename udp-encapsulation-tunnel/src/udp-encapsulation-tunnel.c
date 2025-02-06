@@ -56,9 +56,9 @@ struct connection_store {
 
 struct tunnel_config {
 	/* TODO: typically called "interface" or "iface"? */
-	char device[IFNAMSIZ];
+	char interface[IFNAMSIZ];
 	uint16_t listen_port;
-	char bind_device[IFNAMSIZ];
+	char bind_interface[IFNAMSIZ];
 	/* TODO: typically called "destination_port" or "dport"? */
 	uint16_t endpoint_port;
 	/* TODO: avoid using a list (O(n)), use a HashMap (O(1)) */
@@ -78,7 +78,7 @@ struct tunnel_config {
 static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 			     uint16_t udp_sport, uint16_t tcp_sport)
 {
-	struct connection_store *current = config->store;
+	struct connection_store *current = config->store, *entry;
 
 	/* Check if entry already exists */
 	while (current != NULL) {
@@ -98,8 +98,7 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 	}
 
 	/* Create new entry */
-	struct connection_store *entry =
-	    malloc(sizeof(struct connection_store));
+	entry = malloc(sizeof(struct connection_store));
 	entry->ip_saddr = saddr;
 	entry->udp_sport = udp_sport;
 	entry->tcp_sport = tcp_sport;
@@ -116,6 +115,7 @@ static uint16_t get_stored_port(struct tunnel_config *config,
 				struct in_addr daddr, uint16_t tcp_dport)
 {
 	struct connection_store *current = config->store;
+
 	while (current != NULL) {
 		if (current->ip_saddr.s_addr == daddr.s_addr &&
 		    current->tcp_sport == tcp_dport) {
@@ -123,6 +123,7 @@ static uint16_t get_stored_port(struct tunnel_config *config,
 		}
 		current = current->next;
 	}
+
 	return 0;
 }
 
@@ -149,8 +150,8 @@ static int create_tun(char *dev)
 
 static int get_interface_ip(char *interface, struct in_addr *addr)
 {
-	int fd;
 	struct ifreq ifr;
+	int fd;
 
 	fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0) {
@@ -194,6 +195,9 @@ static uint16_t ip_checksum(void *vdata, size_t length)
 
 static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len)
 {
+	uint16_t checksum;
+	int total_len;
+
 	struct pseudo_header {
 		uint32_t source_address;
 		uint32_t dest_address;
@@ -215,13 +219,13 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len)
 	buffer.hdr.tcp_length = htons(len);
 
 	/* Allocate memory for the calculation */
-	int total_len = sizeof(struct pseudo_header) + len;
+	total_len = sizeof(struct pseudo_header) + len;
 
 	/* Copy pseudo header and TCP header + data */
 	memcpy(&buffer.tcp, tcp, len);
 
 	/* Calculate checksum */
-	uint16_t checksum = ip_checksum(&buffer, total_len);
+	checksum = ip_checksum(&buffer, total_len);
 
 	return checksum;
 }
@@ -229,6 +233,10 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len)
 static uint16_t udp_checksum(struct iphdr *ip, struct udphdr *udp,
 			     void *payload, int payload_len)
 {
+	uint16_t checksum;
+	char *pseudogram;
+	int total_len;
+
 	struct {
 		uint32_t source_address;
 		uint32_t dest_address;
@@ -245,8 +253,8 @@ static uint16_t udp_checksum(struct iphdr *ip, struct udphdr *udp,
 	pseudo_header.udp_length = udp->udp_len;
 
 	/* Calculate total length and allocate memory */
-	int total_len = sizeof(pseudo_header) + ntohs(udp->udp_len);
-	char *pseudogram = malloc(total_len);
+	total_len = sizeof(pseudo_header) + ntohs(udp->udp_len);
+	pseudogram = malloc(total_len);
 
 	/* Copy headers and payload */
 	memcpy(pseudogram, &pseudo_header, sizeof(pseudo_header));
@@ -255,7 +263,7 @@ static uint16_t udp_checksum(struct iphdr *ip, struct udphdr *udp,
 	       payload, payload_len);
 
 	/* Calculate checksum */
-	uint16_t checksum = ip_checksum(pseudogram, total_len);
+	checksum = ip_checksum(pseudogram, total_len);
 
 	free(pseudogram);
 	return checksum;
@@ -264,9 +272,25 @@ static uint16_t udp_checksum(struct iphdr *ip, struct udphdr *udp,
 static void process_tun_packet(int tun_fd, int udp_fd,
 			       struct tunnel_config *config)
 {
-	unsigned char buffer[BUFFER_SIZE];
-	unsigned char encap_buffer[BUFFER_SIZE];
+	unsigned char buffer[BUFFER_SIZE], encap_buffer[BUFFER_SIZE];
+	struct iphdr *ip = (struct iphdr *)buffer, *new_ip;
+	struct sockaddr_in dest;
+	struct in_addr daddr;
+	struct tcphdr *tcp;
+	struct udphdr *udp;
+	uint16_t dport;
 	int len;
+
+	/* TODO: use len from ip->ihl and the size in byte should be >=
+	 * IP_HEADER_LEN
+	 * TODO: len should then be >= len(ip_hdr) + len(tcp_hdr),
+	 * min 20 + 20
+	 */
+	tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN);
+
+	/* Create new IP + UDP header */
+	new_ip = (struct iphdr *)encap_buffer;
+	udp = (struct udphdr *)(encap_buffer + IP_HEADER_LEN);
 
 	len = read(tun_fd, buffer, BUFFER_SIZE);
 	if (len < 0) {
@@ -274,21 +298,12 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 		return;
 	}
 
-	struct iphdr *ip = (struct iphdr *)buffer;
 	/* Only process TCP packets */
 	if (len < IP_HEADER_LEN || ip->protocol != IPPROTO_TCP) {
 		return;
 	}
 
-	/* TODO: use len from ip->ihl and the size in byte should be >=
-	 * IP_HEADER_LEN
-	 * TODO: len should then be >= len(ip_hdr) + len(tcp_hdr),
-	 * min 20 + 20
-	 */
-	struct tcphdr *tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN);
-	struct in_addr daddr;
 	daddr.s_addr = ip->daddr;
-	uint16_t dport;
 
 	/* Determine destination UDP port based on endpoint_port or stored
 	 * connection. This allows the local peer to communicate with multiple
@@ -305,10 +320,6 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 	} else {
 		dport = config->endpoint_port;
 	}
-
-	/* Create new IP + UDP header */
-	struct iphdr *new_ip = (struct iphdr *)encap_buffer;
-	struct udphdr *udp = (struct udphdr *)(encap_buffer + IP_HEADER_LEN);
 
 	/* Setup new IP header */
 	memset(new_ip, 0, IP_HEADER_LEN);
@@ -341,7 +352,6 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 				      len - IP_HEADER_LEN);
 
 	/* Send encapsulated packet */
-	struct sockaddr_in dest;
 	memset(&dest, 0, sizeof(dest));
 	dest.sin_family = AF_INET;
 	dest.sin_addr.s_addr = ip->daddr;
@@ -354,11 +364,16 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 static void process_udp_packet(int tun_fd, int udp_fd,
 			       struct tunnel_config *config)
 {
-	unsigned char buffer[BUFFER_SIZE];
-	unsigned char decap_buffer[BUFFER_SIZE];
+	unsigned char buffer[BUFFER_SIZE], decap_buffer[BUFFER_SIZE];
+	struct iphdr *ip = (struct iphdr *)buffer, *new_ip;
+	struct in_addr src_addr_ip, tun_addr;
+	struct tcphdr *tcp, *new_tcp;
 	struct sockaddr_in src_addr;
-	socklen_t src_addr_len = sizeof(src_addr);
+	socklen_t src_addr_len;
+	struct udphdr *udp;
 	int len;
+
+	src_addr_len = sizeof(src_addr);
 
 	len = recvfrom(udp_fd, buffer, BUFFER_SIZE, 0,
 		       (struct sockaddr *)&src_addr, &src_addr_len);
@@ -367,10 +382,8 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 		return;
 	}
 
-	struct iphdr *ip = (struct iphdr *)buffer;
-	struct udphdr *udp = (struct udphdr *)(buffer + IP_HEADER_LEN);
-	struct tcphdr *tcp =
-	    (struct tcphdr *)(buffer + IP_HEADER_LEN + UDP_HEADER_LEN);
+	udp = (struct udphdr *)(buffer + IP_HEADER_LEN);
+	tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN + UDP_HEADER_LEN);
 	if (len < TCP_HEADER_LEN)
 		return;
 
@@ -382,21 +395,19 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	/* Store the connection information (peer's IPv4 addr, UDP port, TCP
 	 * port) */
 	if (config->endpoint_port == 0) {
-		struct in_addr src_addr_ip;
 		src_addr_ip.s_addr = src_addr.sin_addr.s_addr;
 		store_connection(config, src_addr_ip, ntohs(src_addr.sin_port),
 				 ntohs(tcp->tcp_source));
 	}
 
 	/* Get tunnel interface IP address */
-	struct in_addr tun_addr;
-	if (get_interface_ip(config->device, &tun_addr) < 0) {
+	if (get_interface_ip(config->interface, &tun_addr) < 0) {
 		fprintf(stderr, "Failed to get tunnel interface IP\n");
 		return;
 	}
 
 	/* Create decapsulated packet */
-	struct iphdr *new_ip = (struct iphdr *)decap_buffer;
+	new_ip = (struct iphdr *)decap_buffer;
 
 	/* Setup new IP header */
 	memset(new_ip, 0, IP_HEADER_LEN);
@@ -424,8 +435,7 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	 * is the same as the public one. (on the client side, we might not have
 	 * the public IP)
 	 */
-	struct tcphdr *new_tcp =
-	    (struct tcphdr *)(decap_buffer + IP_HEADER_LEN);
+	new_tcp = (struct tcphdr *)(decap_buffer + IP_HEADER_LEN);
 	new_tcp->tcp_check = 0;
 	new_tcp->tcp_check =
 	    tcp_checksum(new_ip, new_tcp, len - IP_HEADER_LEN - UDP_HEADER_LEN);
@@ -436,69 +446,70 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 
 int main(int argc, char *argv[])
 {
-	struct tunnel_config config = {0};
+	struct tunnel_config config = { };
+	int maxfd, option, tun_fd, udp_fd;
+	struct sockaddr_in addr;
+
 	config.store = NULL;
-	int option;
 
 	/* Parse command line arguments */
 	static struct option long_options[] = {
-	    {"interface", required_argument, 0, 'i'},
-	    {"listen-port", required_argument, 0, 'l'},
-	    {"bind-to-interface", required_argument, 0, 'b'},
-	    /* TODO: typically called "destination-port" | 'd'? */
-	    {"endpoint-port", required_argument, 0, 'e'},
-	    {0, 0, 0, 0}};
+		{ "interface", required_argument, 0, 'i' },
+		{ "listen-port", required_argument, 0, 'l' },
+		{ "bind-to-interface", required_argument, 0, 'b' },
+		{ "endpoint-port", required_argument, 0, 'e' },
+		{ 0, 0, 0, 0 }
+	};
 
 	while ((option = getopt_long(argc, argv, "i:l:b:e:", long_options,
 				     NULL)) != -1) {
 		switch (option) {
 		case 'i':
-			strncpy(config.device, optarg, IFNAMSIZ - 1);
+			strncpy(config.interface, optarg, IFNAMSIZ - 1);
 			break;
 		case 'l':
 			config.listen_port = atoi(optarg);
 			break;
 		case 'b':
-			strncpy(config.bind_device, optarg, IFNAMSIZ - 1);
+			strncpy(config.bind_interface, optarg, IFNAMSIZ - 1);
 			break;
 		case 'e':
 			config.endpoint_port = atoi(optarg);
 			break;
 		default:
-			fprintf(
-			    stderr,
-			    "Usage: %s --interface tun0 --listen-port port "
-			    "--bind-to-interface dev --endpoint-port port\n",
-			    argv[0]);
+			fprintf(stderr,
+				"Usage: %s --interface tun0 --listen-port port --bind-to-interface dev --endpoint-port port\n",
+				argv[0]);
 			exit(1);
 		}
 	}
 
 	/* Validate mandatory options */
-	if (config.device[0] == '\0' || config.listen_port == 0 ||
-	    config.bind_device[0] == '\0') {
-		fprintf(stderr, "Error: interface, listen-port, and "
-				"bind-to-interface are mandatory options\n");
+	if (config.interface[0] == '\0' || config.listen_port == 0 ||
+	    config.bind_interface[0] == '\0') {
+		fprintf(stderr,
+			"Error: interface, listen-port, and bind-to-interface are mandatory options\n");
 		exit(1);
 	}
 
 	/* Create and configure TUN interface */
-	int tun_fd = create_tun(config.device);
+	tun_fd = create_tun(config.interface);
 	if (tun_fd < 0) {
 		fprintf(stderr, "Failed to create TUN interface\n");
 		exit(1);
 	}
 
 	/* Create UDP socket */
-	int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+	udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (udp_fd < 0) {
 		perror("socket");
 		exit(1);
 	}
 
 	/* Bind UDP socket to specific interface */
-	if (setsockopt(udp_fd, SOL_SOCKET, SO_BINDTODEVICE, config.bind_device,
-		       strlen(config.bind_device)) < 0) {
+	if (setsockopt
+	    (udp_fd, SOL_SOCKET, SO_BINDTODEVICE, config.bind_interface,
+	     strlen(config.bind_interface)) < 0) {
 		perror("setsockopt");
 		exit(1);
 	}
@@ -506,7 +517,6 @@ int main(int argc, char *argv[])
 	/* Bind UDP socket to listen port
 	 * TODO: bind() is only needed when ListenPort is defined.
 	 */
-	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -518,8 +528,8 @@ int main(int argc, char *argv[])
 	}
 
 	printf("Tunnel started:\n");
-	printf("TUN interface: %s\n", config.device);
-	printf("Bound to interface: %s\n", config.bind_device);
+	printf("TUN interface: %s\n", config.interface);
+	printf("Bound to interface: %s\n", config.bind_interface);
 	printf("Listening on port: %d\n", config.listen_port);
 	if (config.endpoint_port) {
 		printf("Endpoint port: %d\n", config.endpoint_port);
@@ -534,7 +544,7 @@ int main(int argc, char *argv[])
 		FD_ZERO(&readfds);
 		FD_SET(tun_fd, &readfds);
 		FD_SET(udp_fd, &readfds);
-		int maxfd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
+		maxfd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
 
 		/* TODO: use io_uring if possible? (or at least epoll) */
 		if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0) {
