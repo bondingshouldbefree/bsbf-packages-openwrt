@@ -38,15 +38,17 @@
 /* TODO: can be more if there are options, check len */
 #define TCP_HEADER_LEN	20
 
-/* Connection store entry structure - stores (IPv4 saddr, UDP sport, TCP sport)
+/* struct connection_store -	This is the structure for holding peer's
+ * 				connection information.
+ * @peer_ip_addr:		The IPv4 address of the peer
+ * @udp_sport:			The UDP port of the peer
+ * @peer_tun_ip_addr:		The tunnel IPv4 address of the peer
+ * @next:			Holding the pointer to the next entry
  */
 struct connection_store {
-	/* Peer IPv4 address */
-	struct in_addr ip_saddr;
-	/* Peer UDP port */
+	struct in_addr peer_ip_addr;
 	uint16_t udp_sport;
-	/* Peer TCP port */
-	uint16_t tcp_sport;
+	struct in_addr peer_tun_ip_addr;
 	/* TODO: avoid using a list (O(n)), use a HashMap (O(1)) */
 	struct connection_store *next;
 	/* TODO: store a timestamp: to be able to remove old entries, and handle
@@ -54,12 +56,19 @@ struct connection_store {
 	 */
 };
 
+/* struct tunnel_config -	This is the structure for holding the
+ *				configuration of the programme.
+ * @interface:			The name of the tunnel interface
+ * @listen_port:		The UDP port to listen on
+ * @bind_interface:		The interface to bind on
+ * @endpoint_port:		The UDP port of the endpoint
+ * @store:			Holding the pointer to the connection_store
+ *				structure.
+ */
 struct tunnel_config {
-	/* TODO: typically called "interface" or "iface"? */
 	char interface[IFNAMSIZ];
 	uint16_t listen_port;
 	char bind_interface[IFNAMSIZ];
-	/* TODO: typically called "destination_port" or "dport"? */
 	uint16_t endpoint_port;
 	/* TODO: avoid using a list (O(n)), use a HashMap (O(1)) */
 	struct connection_store *store;
@@ -76,7 +85,7 @@ struct tunnel_config {
 
 /* Store connection information (IPv4 saddr, UDP sport, TCP sport) */
 static void store_connection(struct tunnel_config *config, struct in_addr saddr,
-			     uint16_t udp_sport, uint16_t tcp_sport)
+			     uint16_t udp_sport, struct in_addr tun_saddr)
 {
 	struct connection_store *current = config->store, *entry;
 
@@ -88,9 +97,9 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 		 * tunnel has been restarted) → we cannot predict that which
 		 * one, seems safer to block
 		 */
-		if (current->ip_saddr.s_addr == saddr.s_addr &&
+		if (current->peer_ip_addr.s_addr == saddr.s_addr &&
 		    current->udp_sport == udp_sport &&
-		    current->tcp_sport == tcp_sport) {
+		    current->peer_tun_ip_addr.s_addr == tun_saddr.s_addr) {
 			/* TODO: Update timestamps here */
 			return;
 		}
@@ -99,9 +108,9 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 
 	/* Create new entry */
 	entry = malloc(sizeof(struct connection_store));
-	entry->ip_saddr = saddr;
+	entry->peer_ip_addr = saddr;
 	entry->udp_sport = udp_sport;
-	entry->tcp_sport = tcp_sport;
+	entry->peer_tun_ip_addr = tun_saddr;
 	entry->next = config->store;
 	config->store = entry;
 	/* TODO: we need a way to remove old entries based on a timestamp
@@ -110,15 +119,31 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 	 */
 }
 
-/* Get stored UDP port for given IPv4 address and TCP port */
+/* Get stored IPv4 addr for given tunnel IPv4 address */
+static struct in_addr get_stored_addr(struct tunnel_config *config,
+				      struct in_addr tun_addr)
+{
+	struct in_addr empty_addr = {.s_addr = INADDR_ANY };
+	struct connection_store *current = config->store;
+
+	while (current != NULL) {
+		if (current->peer_tun_ip_addr.s_addr == tun_addr.s_addr) {
+			return current->peer_ip_addr;
+		}
+		current = current->next;
+	}
+
+	return empty_addr;
+}
+
+/* Get stored UDP port for given tunnel IPv4 address */
 static uint16_t get_stored_port(struct tunnel_config *config,
-				struct in_addr daddr, uint16_t tcp_dport)
+				struct in_addr tun_addr)
 {
 	struct connection_store *current = config->store;
 
 	while (current != NULL) {
-		if (current->ip_saddr.s_addr == daddr.s_addr &&
-		    current->tcp_sport == tcp_dport) {
+		if (current->peer_tun_ip_addr.s_addr == tun_addr.s_addr) {
 			return current->udp_sport;
 		}
 		current = current->next;
@@ -273,23 +298,15 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 			       struct tunnel_config *config)
 {
 	unsigned char buffer[BUFFER_SIZE], encap_buffer[BUFFER_SIZE];
-	struct iphdr *ip = (struct iphdr *)buffer, *new_ip;
+	struct iphdr *ip = (struct iphdr *)buffer, *outer_ip;
+	struct in_addr peer_tun_ip_addr, peer_ip_addr;
 	struct sockaddr_in dest;
-	struct in_addr daddr;
-	struct tcphdr *tcp;
 	struct udphdr *udp;
 	uint16_t dport;
 	int len;
 
-	/* TODO: use len from ip->ihl and the size in byte should be >=
-	 * IP_HEADER_LEN
-	 * TODO: len should then be >= len(ip_hdr) + len(tcp_hdr),
-	 * min 20 + 20
-	 */
-	tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN);
-
 	/* Create new IP + UDP header */
-	new_ip = (struct iphdr *)encap_buffer;
+	outer_ip = (struct iphdr *)encap_buffer;
 	udp = (struct udphdr *)(encap_buffer + IP_HEADER_LEN);
 
 	len = read(tun_fd, buffer, BUFFER_SIZE);
@@ -303,7 +320,7 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 		return;
 	}
 
-	daddr.s_addr = ip->daddr;
+	peer_tun_ip_addr.s_addr = ip->daddr;
 
 	/* Determine destination UDP port based on endpoint_port or stored
 	 * connection. This allows the local peer to communicate with multiple
@@ -312,52 +329,56 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 	 * connections.
 	 */
 	if (config->endpoint_port == 0) {
-		dport = get_stored_port(config, daddr, ntohs(tcp->tcp_dest));
+		dport = get_stored_port(config, peer_tun_ip_addr);
 		if (dport == 0) {
-			/* No stored port and no endpoint port configured */
+			return;
+		}
+
+		peer_ip_addr = get_stored_addr(config, peer_tun_ip_addr);
+		if (peer_ip_addr.s_addr == INADDR_ANY) {
 			return;
 		}
 	} else {
 		dport = config->endpoint_port;
+		peer_ip_addr.s_addr = ip->daddr;
 	}
 
 	/* Setup new IP header */
-	memset(new_ip, 0, IP_HEADER_LEN);
-	new_ip->version = 4;
-	new_ip->ihl = 5;
-	new_ip->tos = ip->tos;
-	new_ip->tot_len = htons(len + UDP_HEADER_LEN);
-	new_ip->id = htons(rand());
-	new_ip->ttl = 64;
-	new_ip->protocol = IPPROTO_UDP;
-	new_ip->saddr = 0;
-	new_ip->daddr = ip->daddr;
+	memset(outer_ip, 0, IP_HEADER_LEN);
+	outer_ip->version = 4;
+	outer_ip->ihl = 5;
+	outer_ip->tos = ip->tos;
+	outer_ip->tot_len = htons(len + UDP_HEADER_LEN);
+	outer_ip->id = htons(rand());
+	outer_ip->ttl = 64;
+	outer_ip->protocol = IPPROTO_UDP;
+	outer_ip->saddr = 0;
+	outer_ip->daddr = peer_ip_addr.s_addr;
 
 	/* Calculate IP header checksum */
-	new_ip->check = 0;
-	new_ip->check = ip_checksum(new_ip, IP_HEADER_LEN);
+	outer_ip->check = 0;
+	outer_ip->check = ip_checksum(outer_ip, IP_HEADER_LEN);
 
 	/* Setup UDP header */
 	udp->udp_source = 0;
 	udp->udp_dest = htons(dport);
 	udp->udp_len = htons(len - IP_HEADER_LEN + UDP_HEADER_LEN);
 
-	/* Copy original TCP payload */
-	memcpy(encap_buffer + IP_HEADER_LEN + UDP_HEADER_LEN,
-	       buffer + IP_HEADER_LEN, len - IP_HEADER_LEN);
+	/* Copy original IPv4 header and payload */
+	memcpy(encap_buffer + IP_HEADER_LEN + UDP_HEADER_LEN, buffer, len);
 
 	/* Calculate UDP checksum */
 	udp->udp_check = 0;
-	udp->udp_check = udp_checksum(new_ip, udp, buffer + IP_HEADER_LEN,
+	udp->udp_check = udp_checksum(outer_ip, udp, buffer + IP_HEADER_LEN,
 				      len - IP_HEADER_LEN);
 
 	/* Send encapsulated packet */
 	memset(&dest, 0, sizeof(dest));
 	dest.sin_family = AF_INET;
-	dest.sin_addr.s_addr = ip->daddr;
+	dest.sin_addr.s_addr = peer_ip_addr.s_addr;
 	dest.sin_port = htons(dport);
 
-	sendto(udp_fd, encap_buffer, len + UDP_HEADER_LEN, 0,
+	sendto(udp_fd, encap_buffer, len + IP_HEADER_LEN + UDP_HEADER_LEN, 0,
 	       (struct sockaddr *)&dest, sizeof(dest));
 }
 
@@ -365,11 +386,11 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 			       struct tunnel_config *config)
 {
 	unsigned char buffer[BUFFER_SIZE], decap_buffer[BUFFER_SIZE];
-	struct iphdr *ip = (struct iphdr *)buffer, *new_ip;
-	struct in_addr src_addr_ip, tun_addr;
-	struct tcphdr *tcp, *new_tcp;
+	struct in_addr peer_ip_addr, peer_tun_ip_addr, tun_addr;
+	struct iphdr *outer_ip, *inner_ip, *new_ip;
 	struct sockaddr_in src_addr;
 	socklen_t src_addr_len;
+	struct tcphdr *new_tcp;
 	struct udphdr *udp;
 	int len;
 
@@ -382,20 +403,24 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 		return;
 	}
 
+	outer_ip = (struct iphdr *)(buffer);
 	udp = (struct udphdr *)(buffer + IP_HEADER_LEN);
-	tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN + UDP_HEADER_LEN);
+	inner_ip = (struct iphdr *)(buffer + IP_HEADER_LEN + UDP_HEADER_LEN);
 
 	/* TODO: add some sanity checks, e.g. checking to see if the data in the
 	 * buffer looks OK? e.g. checking if there are MPTCP options? Maybe
 	 * something else?
 	 */
 
-	/* Store the connection information (peer's IPv4 addr, UDP port, TCP
-	 * port) */
+	/* Store the connection information: Peer's IPv4 addr, UDP port, tunnel
+	 * IPv4 addr.
+	 */
 	if (config->endpoint_port == 0) {
-		src_addr_ip.s_addr = src_addr.sin_addr.s_addr;
-		store_connection(config, src_addr_ip, ntohs(src_addr.sin_port),
-				 ntohs(tcp->tcp_source));
+		peer_ip_addr.s_addr = src_addr.sin_addr.s_addr;
+		peer_tun_ip_addr.s_addr = inner_ip->saddr;
+
+		store_connection(config, peer_ip_addr, ntohs(src_addr.sin_port),
+				 peer_tun_ip_addr);
 	}
 
 	/* Get tunnel interface IP address */
@@ -411,22 +436,25 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	memset(new_ip, 0, IP_HEADER_LEN);
 	new_ip->version = 4;
 	new_ip->ihl = 5;
-	new_ip->tos = ip->tos;
+	new_ip->tos = outer_ip->tos;
 	new_ip->tot_len = htons(len - UDP_HEADER_LEN);
 	new_ip->id = htons(rand());
 	new_ip->ttl = 64;
 	new_ip->protocol = IPPROTO_TCP;
-	new_ip->saddr = src_addr.sin_addr.s_addr;
+	if (config->endpoint_port == 0)
+		new_ip->saddr = inner_ip->saddr;
+	else
+		new_ip->saddr = src_addr.sin_addr.s_addr;
 	new_ip->daddr = tun_addr.s_addr;
 
 	/* Calculate IP header checksum */
 	new_ip->check = 0;
 	new_ip->check = ip_checksum(new_ip, IP_HEADER_LEN);
 
-	/* Copy TCP payload */
+	/* Copy TCP header and payload */
 	memcpy(decap_buffer + IP_HEADER_LEN,
-	       buffer + IP_HEADER_LEN + UDP_HEADER_LEN,
-	       len - IP_HEADER_LEN - UDP_HEADER_LEN);
+	       buffer + IP_HEADER_LEN + UDP_HEADER_LEN + IP_HEADER_LEN,
+	       len - IP_HEADER_LEN - UDP_HEADER_LEN - IP_HEADER_LEN);
 
 	/* Calculate TCP checksum
 	 * TODO: it should not be needed on the server side if the TUN address
@@ -436,10 +464,11 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	new_tcp = (struct tcphdr *)(decap_buffer + IP_HEADER_LEN);
 	new_tcp->tcp_check = 0;
 	new_tcp->tcp_check =
-	    tcp_checksum(new_ip, new_tcp, len - IP_HEADER_LEN - UDP_HEADER_LEN);
+	    tcp_checksum(new_ip, new_tcp,
+			 len - IP_HEADER_LEN - UDP_HEADER_LEN - IP_HEADER_LEN);
 
 	/* Write decapsulated packet to TUN interface */
-	write(tun_fd, decap_buffer, len - UDP_HEADER_LEN);
+	write(tun_fd, decap_buffer, len);
 }
 
 int main(int argc, char *argv[])
