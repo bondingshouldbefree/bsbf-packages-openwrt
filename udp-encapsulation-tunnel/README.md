@@ -42,3 +42,45 @@ sudo ./udp-encapsulation-tunnel --interface tun0 --listen-port 12345 --bind-to-i
     - dport:
       - If EndpointPort is not defined, UDP port on the "store" variable found from IPv4 daddr on the packet delivered to tunnel programme.
       - Else, port defined on the EndpointPort option.
+
+---
+
+# Future Logic With Authentication
+
+## Authentication
+
+- If EndpointPort is not defined:
+  - Listen on TCP at ListenPort and wait for remote peers to initiate authentication.
+  - If successfully authenticated, store the IPv4 saddr, UDP sport, and tunnel IPv4 addr of the remote peer to a variable called "store". These three form an entry. There can only be a single entry with the same tunnel IPv4 addr value. Overwrite the entry if there is the same tunnel IPv4 addr with different IPv4 saddr or UDP sport to be stored.
+  - Else, end TCP connection.
+
+## Data RX Path
+
+- Incoming IPv4 packet on bound interface destined to the listened UDP port is delivered to tunnel programme.
+- If EndpointPort is not defined, look for an entry on the "store" variable by using the IPv4 saddr and UDP sport on this packet. If there isn't an entry found, discard the packet.
+- Tunnel programme takes the IPv4 payload, removes the UDP header and inner IPv4 header. Sends it as an incoming IPv4 packet on the tunnel interface.
+  - IPv4 header details:
+    - saddr:
+      - If EndpointPort is not defined, inner IPv4 saddr on the packet delivered to tunnel programme.
+      - Else, outer IPv4 saddr on the packet delivered to tunnel programme.
+    - daddr: First found IPv4 address assigned to the tunnel interface.
+    - Protocol: TCP.
+
+## Data TX Path
+
+- Outgoing IPv4 packet on tunnel interface (tun) is delivered to tunnel programme.
+- Discard the packet if it's not a TCP packet.
+- If EndpointPort is not defined, look for an entry on the "store" variable by using the IPv4 daddr on this packet. If there isn't an entry found, discard the packet.
+- Else, initiate authentication when needed, TCP connection to IPv4 daddr on the packet delivered to tunnel programme and EndpointPort with ListenPort as TCP sport. Deliver credentials and tunnel IPv4 addr. Discard the packet if authentication fails.
+- Tunnel programme takes the IPv4 packet, encapsulates it in UDP. Sends it as an outgoing IPv4 packet on the bound interface.
+  - IPv4 header details:
+    - saddr: First found IPv4 address assigned to the bound interface.
+    - daddr:
+      - If EndpointPort is not defined, IPv4 addr on the "store" variable found from IPv4 daddr on the packet delivered to tunnel programme.
+      - Else, IPv4 daddr on the packet delivered to tunnel programme.
+    - Protocol: UDP.
+  - UDP header details:
+    - sport: Port defined on the ListenPort option.
+    - dport:
+      - If EndpointPort is not defined, UDP port on the "store" variable found from IPv4 daddr on the packet delivered to tunnel programme.
+      - Else, port defined on the EndpointPort option.
