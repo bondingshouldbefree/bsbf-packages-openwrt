@@ -299,7 +299,7 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 	}
 
 	/* Only process TCP packets */
-	if (len < IP_HEADER_LEN || ip->protocol != IPPROTO_TCP) {
+	if (ip->protocol != IPPROTO_TCP) {
 		return;
 	}
 
@@ -384,8 +384,6 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 
 	udp = (struct udphdr *)(buffer + IP_HEADER_LEN);
 	tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN + UDP_HEADER_LEN);
-	if (len < TCP_HEADER_LEN)
-		return;
 
 	/* TODO: add some sanity checks, e.g. checking to see if the data in the
 	 * buffer looks OK? e.g. checking if there are MPTCP options? Maybe
