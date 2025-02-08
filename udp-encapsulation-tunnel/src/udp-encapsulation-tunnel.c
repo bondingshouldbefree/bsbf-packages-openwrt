@@ -11,10 +11,8 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-/* Describe GLIBC-specific member names */
+/* Describe GLIBC-specific member name */
 #ifdef __GLIBC__
-#define uh_ulen		len
-#define uh_sum		check
 #define th_sum		check
 #endif
 
@@ -24,7 +22,6 @@
 #define BUFFER_SIZE	2048
 /* TODO: can be more if there are options, check IHL */
 #define IP_HEADER_LEN	20
-#define UDP_HEADER_LEN	8
 
 /* struct connection_store -	This is the structure for holding peer's
  * 				connection information.
@@ -243,45 +240,6 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len)
 	return checksum;
 }
 
-static uint16_t udp_checksum(struct iphdr *ip, struct udphdr *udp,
-			     void *payload, int payload_len)
-{
-	uint16_t checksum;
-	int total_len;
-
-	struct pseudo_header {
-		uint32_t source_address;
-		uint32_t dest_address;
-		uint8_t placeholder;
-		uint8_t protocol;
-		uint16_t udp_length;
-	};
-
-	struct {
-		struct pseudo_header hdr;
-		unsigned char udp[BUFFER_SIZE];
-	} buffer;
-
-	/* Fill pseudo header */
-	buffer.hdr.source_address = ip->saddr;
-	buffer.hdr.dest_address = ip->daddr;
-	buffer.hdr.placeholder = 0;
-	buffer.hdr.protocol = IPPROTO_UDP;
-	buffer.hdr.udp_length = udp->uh_ulen;
-
-	/* Calculate total length and allocate memory */
-	total_len = sizeof(struct pseudo_header) + ntohs(udp->uh_ulen);
-
-	/* Copy headers and payload */
-	memcpy(&buffer.udp[0], udp, sizeof(struct udphdr));
-	memcpy(&buffer.udp[sizeof(struct udphdr)], payload, payload_len);
-
-	/* Calculate checksum */
-	checksum = ip_checksum(&buffer, total_len);
-
-	return checksum;
-}
-
 static void process_tun_packet(int tun_fd, int udp_fd,
 			       struct tunnel_config *config)
 {
@@ -299,6 +257,9 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 	}
 
 	ip = (struct iphdr *)buffer;
+
+	if (ip->protocol != IPPROTO_TCP)
+		return;
 
 	/* Determine destination UDP port and IPv4 address based on
 	 * endpoint_port or stored connection. This allows the local peer to
@@ -321,9 +282,28 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 		if (daddr.s_addr == INADDR_ANY) {
 			return;
 		}
+
+		/* Move the buffer after the IPv4 header to the start. */
+		memmove(&buffer[0], &buffer[IP_HEADER_LEN],
+			len - IP_HEADER_LEN);
+		/* Adjust packet length to remove the IPv4 header size. */
+		len -= IP_HEADER_LEN;
 	} else {
+		struct in_addr saddr = {.s_addr = ip->saddr };
 		dport = config->endpoint_port;
 		daddr.s_addr = ip->daddr;
+
+		/* Move the buffer after the IPv4 header to the start with the offset of
+		 * the IPv4 addr size.
+		 */
+		memmove(&buffer[sizeof(uint32_t)], &buffer[IP_HEADER_LEN],
+			len - IP_HEADER_LEN);
+		/* Copy IPv4 addr to the start of the buffer. */
+		memcpy(&buffer[0], &saddr, sizeof(uint32_t));
+		/* Adjust packet length to remove the IPv4 header size and add
+		 * the IPv4 addr size.
+		 */
+		len = (len - IP_HEADER_LEN) + sizeof(uint32_t);
 	}
 
 	/* Send encapsulated packet */
@@ -340,8 +320,9 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	struct sockaddr_in sock_src = { };
 	unsigned char buffer[BUFFER_SIZE];
 	struct in_addr tun_ip_addr;
+	struct iphdr ip = { };
 	socklen_t sock_len;
-	struct iphdr *ip;
+	struct tcphdr *tcp;
 	int len;
 
 	sock_len = sizeof(sock_src);
@@ -353,8 +334,6 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 		return;
 	}
 
-	ip = (struct iphdr *)(buffer);
-
 	/* TODO: add some sanity checks, e.g. checking to see if the data in the
 	 * buffer looks OK? e.g. checking if there are MPTCP options? Maybe
 	 * something else?
@@ -365,14 +344,24 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	 */
 	if (config->endpoint_port == 0) {
 		struct in_addr peer_ip_addr, peer_tun_ip_addr;
+		uint32_t saddr;
 
+		memcpy(&saddr, &buffer[0], sizeof(uint32_t));
+		peer_tun_ip_addr.s_addr = saddr;
 		peer_ip_addr.s_addr = sock_src.sin_addr.s_addr;
-		peer_tun_ip_addr.s_addr = ip->saddr;
 
 		store_connection(config, peer_ip_addr, ntohs(sock_src.sin_port),
 				 peer_tun_ip_addr);
+
+		/* Move the buffer after the IPv4 addr to the start. */
+		memmove(&buffer[0], &buffer[sizeof(uint32_t)],
+			len - sizeof(uint32_t));
+		/* Adjust packet length to remove the IPv4 addr size. */
+		len -= sizeof(uint32_t);
+
+		ip.saddr = peer_tun_ip_addr.s_addr;
 	} else {
-		ip->saddr = sock_src.sin_addr.s_addr;
+		ip.saddr = sock_src.sin_addr.s_addr;
 	}
 
 	/* Get tunnel interface IP address */
@@ -381,28 +370,24 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 		return;
 	}
 
-	ip->daddr = tun_ip_addr.s_addr;
+	ip.daddr = tun_ip_addr.s_addr;
+	ip.version = 4;
+	ip.ihl = 5;
+	ip.tot_len = htons(len + IP_HEADER_LEN);
+	ip.protocol = IPPROTO_TCP;
+	ip.check = ip_checksum(&ip, IP_HEADER_LEN);
 
-	/* Recalculate IP header checksum after modifying addresses */
-	ip->check = 0;
-	ip->check = ip_checksum(ip, IP_HEADER_LEN);
+	/* Make space for the IPv4 header */
+	memmove(&buffer[IP_HEADER_LEN], &buffer[0], len);
+	/* Insert the IPv4 header */
+	memcpy(&buffer[0], &ip, IP_HEADER_LEN);
+	/* Update total packet length */
+	len += IP_HEADER_LEN;
 
-	/* Recalculate TCP or UDP checksums if present */
-	if (ip->protocol == IPPROTO_TCP) {
-		struct tcphdr *tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN);
-
-		tcp->th_sum = 0;
-		tcp->th_sum = tcp_checksum(ip, tcp, len - IP_HEADER_LEN);
-	} else if (ip->protocol == IPPROTO_UDP) {
-		struct udphdr *udp = (struct udphdr *)(buffer + IP_HEADER_LEN);
-
-		udp->uh_sum = 0;
-		udp->uh_sum = udp_checksum(ip, udp,
-					   buffer + IP_HEADER_LEN +
-					   UDP_HEADER_LEN,
-					   len - IP_HEADER_LEN -
-					   UDP_HEADER_LEN);
-	}
+	/* Recalculate TCP checksum */
+	tcp = (struct tcphdr *)(buffer + IP_HEADER_LEN);
+	tcp->th_sum = 0;
+	tcp->th_sum = tcp_checksum(&ip, tcp, len - IP_HEADER_LEN);
 
 	/* Write decapsulated packet to TUN interface */
 	write(tun_fd, buffer, len);
