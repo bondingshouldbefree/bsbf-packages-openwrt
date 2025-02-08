@@ -18,7 +18,9 @@
 #define th_sum		check
 #endif
 
-/* TODO: Would it make sense to set to 1500? */
+/* TODO: Calculate the max needed buffer size to accommodate the memmove
+ * operations.
+ */
 #define BUFFER_SIZE	2048
 /* TODO: can be more if there are options, check IHL */
 #define IP_HEADER_LEN	20
@@ -27,13 +29,13 @@
 /* struct connection_store -	This is the structure for holding peer's
  * 				connection information.
  * @peer_ip_addr:		The IPv4 address of the peer
- * @udp_sport:			The UDP port of the peer
+ * @peer_udp_port:		The UDP port of the peer
  * @peer_tun_ip_addr:		The tunnel IPv4 address of the peer
  * @next:			Holding the pointer to the next entry
  */
 struct connection_store {
 	struct in_addr peer_ip_addr;
-	uint16_t udp_sport;
+	uint16_t peer_udp_port;
 	struct in_addr peer_tun_ip_addr;
 	/* TODO: avoid using a list (O(n)), use a HashMap (O(1)) */
 	struct connection_store *next;
@@ -69,7 +71,7 @@ struct tunnel_config {
  * another client is added later)
  */
 
-/* Store connection information (IPv4 saddr, UDP sport, TCP sport) */
+/* Store connection information: peer's IPv4 addr, UDP port, tunnel IPv4 addr */
 static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 			     uint16_t udp_sport, struct in_addr tun_saddr)
 {
@@ -84,7 +86,7 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 		 * one, seems safer to block
 		 */
 		if (current->peer_ip_addr.s_addr == saddr.s_addr &&
-		    current->udp_sport == udp_sport &&
+		    current->peer_udp_port == udp_sport &&
 		    current->peer_tun_ip_addr.s_addr == tun_saddr.s_addr) {
 			/* TODO: Update timestamps here */
 			return;
@@ -95,7 +97,7 @@ static void store_connection(struct tunnel_config *config, struct in_addr saddr,
 	/* Create new entry */
 	entry = malloc(sizeof(struct connection_store));
 	entry->peer_ip_addr = saddr;
-	entry->udp_sport = udp_sport;
+	entry->peer_udp_port = udp_sport;
 	entry->peer_tun_ip_addr = tun_saddr;
 	entry->next = config->store;
 	config->store = entry;
@@ -131,7 +133,7 @@ static uint16_t get_stored_port(struct tunnel_config *config,
 
 	while (current != NULL) {
 		if (current->peer_tun_ip_addr.s_addr == tun_addr.s_addr) {
-			return current->udp_sport;
+			return current->peer_udp_port;
 		}
 		current = current->next;
 	}
@@ -233,7 +235,7 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len)
 	total_len = sizeof(struct pseudo_header) + len;
 
 	/* Copy pseudo header, TCP header, and payload */
-	memcpy(&buffer.tcp, tcp, len);
+	memcpy(&buffer.tcp[0], tcp, len);
 
 	/* Calculate checksum */
 	checksum = ip_checksum(&buffer, total_len);
@@ -285,7 +287,7 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 {
 	unsigned char buffer[BUFFER_SIZE];
 	struct sockaddr_in dest = { };
-	struct in_addr peer_ip_addr;
+	struct in_addr daddr;
 	struct iphdr *ip;
 	uint16_t dport;
 	int len;
@@ -298,35 +300,35 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 
 	ip = (struct iphdr *)buffer;
 
-	/* Determine destination UDP port based on endpoint_port or stored
-	 * connection. This allows the local peer to communicate with multiple
-	 * remote peers. Also, endpoint port cannot be hardcoded in case of port
-	 * translation on peer's network; it must be found from previous
-	 * connections.
+	/* Determine destination UDP port and IPv4 address based on
+	 * endpoint_port or stored connection. This allows the local peer to
+	 * communicate with multiple remote peers. Also, endpoint port cannot be
+	 * hardcoded in case of port translation on peer's network; it must be
+	 * found from previous connections.
 	 */
 	if (config->endpoint_port == 0) {
-		struct in_addr peer_tun_ip_addr;
-
-		peer_tun_ip_addr.s_addr = ip->daddr;
+		struct in_addr peer_tun_ip_addr = {.s_addr = ip->daddr };
 
 		dport = get_stored_port(config, peer_tun_ip_addr);
 		if (dport == 0) {
 			return;
 		}
 
-		peer_ip_addr = get_stored_addr(config, peer_tun_ip_addr);
-		/* TODO: The check below is unnecessary. If dport is found, this will be there as well. */
-		if (peer_ip_addr.s_addr == INADDR_ANY) {
+		daddr = get_stored_addr(config, peer_tun_ip_addr);
+		/* TODO: The check below is unnecessary. If dport is found, this
+		 * will be there as well.
+		 */
+		if (daddr.s_addr == INADDR_ANY) {
 			return;
 		}
 	} else {
 		dport = config->endpoint_port;
-		peer_ip_addr.s_addr = ip->daddr;
+		daddr.s_addr = ip->daddr;
 	}
 
 	/* Send encapsulated packet */
 	dest.sin_family = AF_INET;
-	dest.sin_addr.s_addr = peer_ip_addr.s_addr;
+	dest.sin_addr.s_addr = daddr.s_addr;
 	dest.sin_port = htons(dport);
 
 	sendto(udp_fd, buffer, len, 0, (struct sockaddr *)&dest, sizeof(dest));
@@ -335,17 +337,17 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 static void process_udp_packet(int tun_fd, int udp_fd,
 			       struct tunnel_config *config)
 {
-	struct sockaddr_in src_addr = { };
+	struct sockaddr_in sock_src = { };
 	unsigned char buffer[BUFFER_SIZE];
-	struct in_addr tun_addr;
-	socklen_t src_addr_len;
+	struct in_addr tun_ip_addr;
+	socklen_t sock_len;
 	struct iphdr *ip;
 	int len;
 
-	src_addr_len = sizeof(src_addr);
+	sock_len = sizeof(sock_src);
 
 	len = recvfrom(udp_fd, buffer, BUFFER_SIZE, 0,
-		       (struct sockaddr *)&src_addr, &src_addr_len);
+		       (struct sockaddr *)&sock_src, &sock_len);
 	if (len < 0) {
 		perror("recvfrom");
 		return;
@@ -364,22 +366,22 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	if (config->endpoint_port == 0) {
 		struct in_addr peer_ip_addr, peer_tun_ip_addr;
 
-		peer_ip_addr.s_addr = src_addr.sin_addr.s_addr;
+		peer_ip_addr.s_addr = sock_src.sin_addr.s_addr;
 		peer_tun_ip_addr.s_addr = ip->saddr;
 
-		store_connection(config, peer_ip_addr, ntohs(src_addr.sin_port),
+		store_connection(config, peer_ip_addr, ntohs(sock_src.sin_port),
 				 peer_tun_ip_addr);
 	} else {
-		ip->saddr = src_addr.sin_addr.s_addr;
+		ip->saddr = sock_src.sin_addr.s_addr;
 	}
 
 	/* Get tunnel interface IP address */
-	if (get_interface_ip(config->interface, &tun_addr) < 0) {
+	if (get_interface_ip(config->interface, &tun_ip_addr) < 0) {
 		fprintf(stderr, "Failed to get tunnel interface IP\n");
 		return;
 	}
 
-	ip->daddr = tun_addr.s_addr;
+	ip->daddr = tun_ip_addr.s_addr;
 
 	/* Recalculate IP header checksum after modifying addresses */
 	ip->check = 0;
