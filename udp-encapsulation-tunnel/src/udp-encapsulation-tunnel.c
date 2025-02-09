@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Describe GLIBC-specific member name */
@@ -27,22 +28,24 @@
 #define IPV4_ADDR_START	"10.0.0.2"
 #define IPV4_ADDR_END	"10.0.0.254"
 
+/* Add after the other defines */
+#define CONN_TIMEOUT	300
+
 /* struct connection_store -	This is the structure for holding peer's
  * 				connection information.
  * @peer_ip_addr:		The IPv4 address of the peer
  * @peer_udp_port:		The UDP port of the peer
  * @peer_tun_ip_addr:		The tunnel IPv4 address of the peer
+ * @last_seen:			Timestamp of the last connection
  * @next:			Holding the pointer to the next entry
  */
 struct connection_store {
 	struct in_addr peer_ip_addr;
 	uint16_t peer_udp_port;
 	struct in_addr peer_tun_ip_addr;
+	time_t last_seen;
 	/* TODO: avoid using a list (O(n)), use a HashMap (O(1)) */
 	struct connection_store *next;
-	/* TODO: store a timestamp: to be able to remove old entries, and handle
-	 * conflicts: same IP + TCP port, but different UDP port
-	 */
 };
 
 /* struct tunnel_config -	This is the structure for holding the
@@ -119,6 +122,8 @@ static struct in_addr store_connection(struct tunnel_config *config,
 	while (current != NULL) {
 		if (current->peer_ip_addr.s_addr == saddr.s_addr &&
 		    current->peer_udp_port == udp_sport) {
+			/* Update timestamp and return existing tunnel IP */
+			current->last_seen = time(NULL);
 			return current->peer_tun_ip_addr;
 		}
 		current = current->next;
@@ -140,9 +145,9 @@ static struct in_addr store_connection(struct tunnel_config *config,
 	entry->peer_ip_addr = saddr;
 	entry->peer_udp_port = udp_sport;
 	entry->peer_tun_ip_addr.s_addr = local_ip;
+	entry->last_seen = time(NULL);
 	entry->next = config->store;
 	config->store = entry;
-	/* TODO: we need a way to remove old entries based on a timestamp. */
 
 	assigned_addr.s_addr = local_ip;
 	return assigned_addr;
@@ -470,10 +475,38 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	write(tun_fd, buffer, len);
 }
 
+static void cleanup_old_connections(struct tunnel_config *config)
+{
+	struct connection_store *current = config->store;
+	struct connection_store *prev = NULL;
+	struct connection_store *next;
+	time_t now = time(NULL);
+
+	while (current != NULL) {
+		next = current->next;
+
+		if (now - current->last_seen > CONN_TIMEOUT) {
+			/* Remove this old entry */
+			if (prev == NULL) {
+				/* First item in list */
+				config->store = next;
+			} else {
+				prev->next = next;
+			}
+			free(current);
+		} else {
+			prev = current;
+		}
+
+		current = next;
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	int maxfd, option, tun_fd, udp_fd;
 	struct tunnel_config config = { };
+	time_t last_cleanup = time(NULL);
 	struct sockaddr_in addr = { };
 
 	/* Parse command line arguments */
@@ -566,15 +599,27 @@ int main(int argc, char *argv[])
 	 */
 	fd_set readfds;
 	while (1) {
+		struct timeval timeout = {
+			.tv_sec = 60,
+			.tv_usec = 0
+		};
+
 		FD_ZERO(&readfds);
 		FD_SET(tun_fd, &readfds);
 		FD_SET(udp_fd, &readfds);
 		maxfd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
 
 		/* TODO: use io_uring if possible? (or at least epoll) */
-		if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0) {
+		if (select(maxfd + 1, &readfds, NULL, NULL, &timeout) < 0) {
 			perror("select");
 			exit(1);
+		}
+
+		/* Run cleanup periodically */
+		time_t now = time(NULL);
+		if (now - last_cleanup >= 60) {
+			cleanup_old_connections(&config);
+			last_cleanup = now;
 		}
 
 		if (FD_ISSET(tun_fd, &readfds)) {
