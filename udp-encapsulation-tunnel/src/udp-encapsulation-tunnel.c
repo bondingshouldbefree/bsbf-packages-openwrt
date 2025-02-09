@@ -1,15 +1,18 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
-#include <netinet/udp.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/sysinfo.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -51,6 +54,7 @@ struct connection_store {
  * @listen_port:		The UDP port to listen on
  * @bind_interface:		The interface to bind on
  * @endpoint_port:		The UDP port of the endpoint
+ * @store_mutex:		Mutex for accessing the store
  * @store:			Holding the pointer to the connection_store
  *				structure.
  */
@@ -59,6 +63,7 @@ struct tunnel_config {
 	uint16_t listen_port;
 	char bind_interface[IFNAMSIZ];
 	uint16_t endpoint_port;
+	pthread_mutex_t store_mutex;
 	/* TODO: avoid using a list (O(n)), use a HashMap (O(1)) */
 	struct connection_store *store;
 };
@@ -164,7 +169,6 @@ static struct in_addr get_stored_addr(struct tunnel_config *config,
 		current = current->next;
 	}
 
-	/* TODO: This will never return. If dport is found, above is going to return. */
 	return empty_addr;
 }
 
@@ -377,16 +381,12 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 	if (config->endpoint_port == 0) {
 		struct in_addr peer_tun_ip_addr = {.s_addr = ip->daddr };
 
+		pthread_mutex_lock(&config->store_mutex);
 		dport = get_stored_port(config, peer_tun_ip_addr);
-		if (dport == 0) {
-			return;
-		}
-
 		daddr = get_stored_addr(config, peer_tun_ip_addr);
-		/* TODO: The check below is unnecessary. If dport is found, this
-		 * will be there as well.
-		 */
-		if (daddr.s_addr == INADDR_ANY) {
+		pthread_mutex_unlock(&config->store_mutex);
+
+		if (dport == 0 || daddr.s_addr == INADDR_ANY) {
 			return;
 		}
 	} else {
@@ -434,8 +434,11 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	if (config->endpoint_port == 0) {
 		struct in_addr peer_tun_ip_addr;
 
+		pthread_mutex_lock(&config->store_mutex);
 		peer_tun_ip_addr = store_connection(config, sock_src.sin_addr,
 						    ntohs(sock_src.sin_port));
+		pthread_mutex_unlock(&config->store_mutex);
+
 		if (peer_tun_ip_addr.s_addr == INADDR_ANY) {
 			return;
 		}
@@ -499,6 +502,72 @@ static void cleanup_old_connections(struct tunnel_config *config)
 
 		current = next;
 	}
+}
+
+static void worker_process(int tun_fd, int udp_fd, struct tunnel_config *config)
+{
+	fd_set readfds;
+	int maxfd;
+	time_t last_cleanup = time(NULL);
+
+	/* Block signals that should be handled by the parent */
+	sigset_t mask;
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &mask, NULL);
+
+	printf("Worker process started (PID: %d)\n", getpid());
+
+	while (1) {
+		struct timeval timeout = {
+			.tv_sec = 60,
+			.tv_usec = 0
+		};
+
+		FD_ZERO(&readfds);
+		FD_SET(tun_fd, &readfds);
+		FD_SET(udp_fd, &readfds);
+		maxfd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
+
+		if (select(maxfd + 1, &readfds, NULL, NULL, &timeout) < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("select");
+			exit(1);
+		}
+
+		/* Run cleanup periodically */
+		time_t now = time(NULL);
+		if (now - last_cleanup >= 60) {
+			pthread_mutex_lock(&config->store_mutex);
+			cleanup_old_connections(config);
+			pthread_mutex_unlock(&config->store_mutex);
+			last_cleanup = now;
+		}
+
+		if (FD_ISSET(tun_fd, &readfds)) {
+			process_tun_packet(tun_fd, udp_fd, config);
+		}
+
+		if (FD_ISSET(udp_fd, &readfds)) {
+			process_udp_packet(tun_fd, udp_fd, config);
+		}
+	}
+}
+
+static void signal_handler(int signo)
+{
+	/* Forward signal to all children */
+	kill(0, signo);
+	exit(0);
+}
+
+static int get_num_workers(void)
+{
+	int num_cores = get_nprocs();
+	/* Leave one core free for the parent process and system tasks */
+	return num_cores > 1 ? num_cores - 1 : 1;
 }
 
 int main(int argc, char *argv[])
@@ -592,43 +661,68 @@ int main(int argc, char *argv[])
 		printf("Endpoint port: %d\n", config.endpoint_port);
 	}
 
-	/* Main loop
-	 * TODO: use multiple workers to be able to scale on a host with more
-	 * than one core.
-	 */
-	fd_set readfds;
-	while (1) {
-		struct timeval timeout = {
-			.tv_sec = 60,
-			.tv_usec = 0
-		};
+	/* Initialize mutex */
+	pthread_mutex_init(&config.store_mutex, NULL);
 
-		FD_ZERO(&readfds);
-		FD_SET(tun_fd, &readfds);
-		FD_SET(udp_fd, &readfds);
-		maxfd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
+	/* Set up signal handling */
+	struct sigaction sa = {
+		.sa_handler = signal_handler,
+		.sa_flags = SA_RESTART,
+	};
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
 
-		/* TODO: use io_uring if possible? (or at least epoll) */
-		if (select(maxfd + 1, &readfds, NULL, NULL, &timeout) < 0) {
-			perror("select");
+	/* Create worker processes */
+	int num_workers = get_num_workers();
+	printf("Starting %d worker processes (system has %d cores)\n",
+	       num_workers, get_nprocs());
+
+	for (int i = 0; i < num_workers; i++) {
+		pid_t pid = fork();
+
+		if (pid < 0) {
+			perror("fork");
 			exit(1);
 		}
 
-		/* Run cleanup periodically */
-		time_t now = time(NULL);
-		if (now - last_cleanup >= 60) {
-			cleanup_old_connections(&config);
-			last_cleanup = now;
-		}
-
-		if (FD_ISSET(tun_fd, &readfds)) {
-			process_tun_packet(tun_fd, udp_fd, &config);
-		}
-
-		if (FD_ISSET(udp_fd, &readfds)) {
-			process_udp_packet(tun_fd, udp_fd, &config);
+		if (pid == 0) {
+			worker_process(tun_fd, udp_fd, &config);
+			exit(0);
 		}
 	}
 
+	/* Parent process */
+	while (1) {
+		int status;
+		pid_t pid = wait(&status);
+
+		if (pid < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("wait");
+			exit(1);
+		}
+
+		/* If worker died abnormally, create a new one */
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			printf
+			    ("Worker process %d died abnormally, starting new worker\n",
+			     pid);
+			pid = fork();
+
+			if (pid < 0) {
+				perror("fork");
+				exit(1);
+			}
+
+			if (pid == 0) {
+				worker_process(tun_fd, udp_fd, &config);
+				exit(0);
+			}
+		}
+	}
+
+	pthread_mutex_destroy(&config.store_mutex);
 	return 0;
 }
