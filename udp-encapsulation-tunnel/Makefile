@@ -3,6 +3,9 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=udp-encapsulation-tunnel
 PKG_VERSION:=1.0
 PKG_RELEASE:=1
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/bondingshouldbefree/udp-encapsulation-tunnel.git
+PKG_SOURCE_VERSION:=main
 
 include $(INCLUDE_DIR)/package.mk
 
