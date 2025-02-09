@@ -21,7 +21,6 @@
  * operations.
  */
 #define BUFFER_SIZE	2048
-/* TODO: can be more if there are options, check IHL */
 #define IP_HEADER_LEN	20
 
 /* Define the range for IPv4 addr assignment */
@@ -362,7 +361,7 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 
 	ip = (struct iphdr *)buffer;
 
-	if (ip->protocol != IPPROTO_TCP)
+	if (ip->protocol != IPPROTO_TCP || ip->ihl != 5)
 		return;
 
 	/* Determine destination UDP port and IPv4 address based on
