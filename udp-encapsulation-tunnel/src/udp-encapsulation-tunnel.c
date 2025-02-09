@@ -183,10 +183,62 @@ static uint16_t get_stored_port(struct tunnel_config *config,
 	return 0;
 }
 
-static int create_tun(char *dev)
+static int get_interface_mtu(char *interface)
 {
 	struct ifreq ifr = { };
-	int err, fd;
+	int fd;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		return -1;
+	}
+
+	strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFMTU, &ifr) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
+	return ifr.ifr_mtu;
+}
+
+static int set_interface_mtu(char *interface, int mtu)
+{
+	struct ifreq ifr = { };
+	int fd;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		return -1;
+	}
+
+	strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+	ifr.ifr_mtu = mtu;
+
+	if (ioctl(fd, SIOCSIFMTU, &ifr) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
+	return 0;
+}
+
+static int create_tun(char *dev, char *bind_interface)
+{
+	struct ifreq ifr = { };
+	int err, fd, mtu;
+
+	/* Get bind interface MTU */
+	mtu = get_interface_mtu(bind_interface);
+	if (mtu < 0) {
+		fprintf(stderr, "Failed to get bind interface MTU\n");
+		return -1;
+	}
+
+	/* Subtract 8 bytes for UDP header */
+	mtu -= 8;
 
 	if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
 		return fd;
@@ -198,6 +250,13 @@ static int create_tun(char *dev)
 	if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
 		close(fd);
 		return err;
+	}
+
+	/* Set TUN interface MTU */
+	if (set_interface_mtu(dev, mtu) < 0) {
+		fprintf(stderr, "Failed to set TUN interface MTU\n");
+		close(fd);
+		return -1;
 	}
 
 	return fd;
@@ -459,7 +518,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Create and configure TUN interface */
-	tun_fd = create_tun(config.interface);
+	tun_fd = create_tun(config.interface, config.bind_interface);
 	if (tun_fd < 0) {
 		fprintf(stderr, "Failed to create TUN interface\n");
 		exit(1);
