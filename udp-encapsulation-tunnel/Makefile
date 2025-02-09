@@ -1,7 +1,6 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=udp-encapsulation-tunnel
-PKG_VERSION:=1.0
 PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/bondingshouldbefree/udp-encapsulation-tunnel.git
@@ -24,8 +23,11 @@ endef
 define Package/udp-encapsulation-tunnel/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(CP) $(PKG_BUILD_DIR)/udp-encapsulation-tunnel $(1)/usr/bin
-#	$(INSTALL_DIR) $(1)/etc/init.d
-#	$(INSTALL_BIN) ./files/udp-encapsulation-tunnel.init $(1)/etc/init.d/udp-encapsulation-tunnel
+
+	$(INSTALL_DIR) $(1)/etc/config/
+	$(INSTALL_CONF) ./files/udp-encapsulation-tunnel.conf $(1)/etc/config/udp-encapsulation-tunnel
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/udp-encapsulation-tunnel.init $(1)/etc/init.d/udp-encapsulation-tunnel
 endef
 
 $(eval $(call BuildPackage,udp-encapsulation-tunnel))
