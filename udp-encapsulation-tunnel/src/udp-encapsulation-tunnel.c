@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/if_tun.h>
@@ -22,6 +23,10 @@
 #define BUFFER_SIZE	2048
 /* TODO: can be more if there are options, check IHL */
 #define IP_HEADER_LEN	20
+
+/* Define the range for IPv4 addr assignment */
+#define IPV4_ADDR_START	"10.0.0.2"
+#define IPV4_ADDR_END	"10.0.0.254"
 
 /* struct connection_store -	This is the structure for holding peer's
  * 				connection information.
@@ -68,40 +73,80 @@ struct tunnel_config {
  * another client is added later)
  */
 
-/* Store connection information: peer's IPv4 addr, UDP port, tunnel IPv4 addr */
-static void store_connection(struct tunnel_config *config, struct in_addr saddr,
-			     uint16_t udp_sport, struct in_addr tun_saddr)
+/* Helper function to generate a random IP in our range */
+static uint32_t generate_random_local_ip(void)
 {
-	struct connection_store *current = config->store, *entry;
+	uint32_t start_ip, end_ip, range;
+	static int initialized = 0;
 
-	/* Check if entry already exists */
+	if (!initialized) {
+		srand(0);
+		initialized = 1;
+	}
+
+	start_ip = ntohl(inet_addr(IPV4_ADDR_START));
+	end_ip = ntohl(inet_addr(IPV4_ADDR_END));
+	range = end_ip - start_ip;
+
+	return htonl(start_ip + (rand() % range));
+}
+
+/* Helper function to check if IP is already assigned */
+static int is_ip_in_use(struct tunnel_config *config, uint32_t ip)
+{
+	struct connection_store *current = config->store;
+
 	while (current != NULL) {
-		/* TODO: if ADDR + TCP port match, but not UDP port, we have a
-		 * conflict: check timestamp and either block the connection
-		 * (e.g. different client behind the same IP), or replace (e.g.
-		 * tunnel has been restarted) → we cannot predict that which
-		 * one, seems safer to block
-		 */
-		if (current->peer_ip_addr.s_addr == saddr.s_addr &&
-		    current->peer_udp_port == udp_sport &&
-		    current->peer_tun_ip_addr.s_addr == tun_saddr.s_addr) {
-			/* TODO: Update timestamps here */
-			return;
+		if (current->peer_tun_ip_addr.s_addr == ip) {
+			return 1;
 		}
 		current = current->next;
 	}
 
-	/* Create new entry */
+	return 0;
+}
+
+/* Store connection information: peer's IPv4 addr, UDP port, and return the
+ * assigned tunnel IPv4 address.
+ */
+static struct in_addr store_connection(struct tunnel_config *config,
+				       struct in_addr saddr, uint16_t udp_sport)
+{
+	struct connection_store *current = config->store, *entry;
+	struct in_addr assigned_addr = {.s_addr = INADDR_ANY };
+	uint32_t local_ip;
+
+	/* Check if entry already exists */
+	while (current != NULL) {
+		if (current->peer_ip_addr.s_addr == saddr.s_addr &&
+		    current->peer_udp_port == udp_sport) {
+			return current->peer_tun_ip_addr;
+		}
+		current = current->next;
+	}
+
+	/* Create new entry with random local IP */
 	entry = malloc(sizeof(struct connection_store));
+	if (!entry) {
+		fprintf(stderr,
+			"Failed to allocate memory for connection store\n");
+		return assigned_addr;
+	}
+
+	/* Generate unique random local IP */
+	do {
+		local_ip = generate_random_local_ip();
+	} while (is_ip_in_use(config, local_ip));
+
 	entry->peer_ip_addr = saddr;
 	entry->peer_udp_port = udp_sport;
-	entry->peer_tun_ip_addr = tun_saddr;
+	entry->peer_tun_ip_addr.s_addr = local_ip;
 	entry->next = config->store;
 	config->store = entry;
-	/* TODO: we need a way to remove old entries based on a timestamp
-	 * because an entry will be create for each TCP connection, so very
-	 * likely thousands per minute / second on a busy server.
-	 */
+	/* TODO: we need a way to remove old entries based on a timestamp. */
+
+	assigned_addr.s_addr = local_ip;
+	return assigned_addr;
 }
 
 /* Get stored IPv4 addr for given tunnel IPv4 address */
@@ -282,28 +327,9 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 		if (daddr.s_addr == INADDR_ANY) {
 			return;
 		}
-
-		/* Move the buffer after the IPv4 header to the start. */
-		memmove(&buffer[0], &buffer[IP_HEADER_LEN],
-			len - IP_HEADER_LEN);
-		/* Adjust packet length to remove the IPv4 header size. */
-		len -= IP_HEADER_LEN;
 	} else {
-		struct in_addr saddr = {.s_addr = ip->saddr };
 		dport = config->endpoint_port;
 		daddr.s_addr = ip->daddr;
-
-		/* Move the buffer after the IPv4 header to the start with the offset of
-		 * the IPv4 addr size.
-		 */
-		memmove(&buffer[sizeof(uint32_t)], &buffer[IP_HEADER_LEN],
-			len - IP_HEADER_LEN);
-		/* Copy IPv4 addr to the start of the buffer. */
-		memcpy(&buffer[0], &saddr, sizeof(uint32_t));
-		/* Adjust packet length to remove the IPv4 header size and add
-		 * the IPv4 addr size.
-		 */
-		len = (len - IP_HEADER_LEN) + sizeof(uint32_t);
 	}
 
 	/* Send encapsulated packet */
@@ -311,7 +337,8 @@ static void process_tun_packet(int tun_fd, int udp_fd,
 	dest.sin_addr.s_addr = daddr.s_addr;
 	dest.sin_port = htons(dport);
 
-	sendto(udp_fd, buffer, len, 0, (struct sockaddr *)&dest, sizeof(dest));
+	sendto(udp_fd, &buffer[IP_HEADER_LEN], len - IP_HEADER_LEN, 0,
+	       (struct sockaddr *)&dest, sizeof(dest));
 }
 
 static void process_udp_packet(int tun_fd, int udp_fd,
@@ -343,21 +370,13 @@ static void process_udp_packet(int tun_fd, int udp_fd,
 	 * IPv4 addr.
 	 */
 	if (config->endpoint_port == 0) {
-		struct in_addr peer_ip_addr, peer_tun_ip_addr;
-		uint32_t saddr;
+		struct in_addr peer_tun_ip_addr;
 
-		memcpy(&saddr, &buffer[0], sizeof(uint32_t));
-		peer_tun_ip_addr.s_addr = saddr;
-		peer_ip_addr.s_addr = sock_src.sin_addr.s_addr;
-
-		store_connection(config, peer_ip_addr, ntohs(sock_src.sin_port),
-				 peer_tun_ip_addr);
-
-		/* Move the buffer after the IPv4 addr to the start. */
-		memmove(&buffer[0], &buffer[sizeof(uint32_t)],
-			len - sizeof(uint32_t));
-		/* Adjust packet length to remove the IPv4 addr size. */
-		len -= sizeof(uint32_t);
+		peer_tun_ip_addr = store_connection(config, sock_src.sin_addr,
+						    ntohs(sock_src.sin_port));
+		if (peer_tun_ip_addr.s_addr == INADDR_ANY) {
+			return;
+		}
 
 		ip.saddr = peer_tun_ip_addr.s_addr;
 	} else {
