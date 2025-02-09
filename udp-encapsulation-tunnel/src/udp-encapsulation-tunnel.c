@@ -18,10 +18,7 @@
 #define th_sum		check
 #endif
 
-/* TODO: Calculate the max needed buffer size to accommodate the memmove
- * operations.
- */
-#define BUFFER_SIZE	2048
+#define BUFFER_SIZE	1492
 #define IP_HEADER_LEN	20
 
 /* Define the range for IPv4 addr assignment */
@@ -242,6 +239,8 @@ static int create_tun(char *dev, char *bind_interface)
 	}
 
 	/* Subtract 8 bytes for UDP header */
+	if (mtu > 1500)
+		mtu = 1500;
 	mtu -= 8;
 
 	if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
