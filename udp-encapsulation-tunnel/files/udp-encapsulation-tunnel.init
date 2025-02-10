@@ -11,11 +11,24 @@ start_service() {
 	local interface
 	local listen_port
 	local bind_to_interface
+	local bind_to_interface_of_device
 	local endpoint_port
 	config_get interface "config" "interface"
 	config_get listen_port "config" "listen_port"
 	config_get bind_to_interface "config" "bind_to_interface"
+	config_get bind_to_interface_of_device "config" "bind_to_interface_of_device"
 	config_get endpoint_port "config" "endpoint_port"
+
+	# If bind_to_interface_of_device is set, use it to find the actual interface
+	if [ -n "$bind_to_interface_of_device" ]; then
+		local net_path
+		net_path=$(find "$bind_to_interface_of_device" -type d -name "net")
+		if [ -n "$net_path" ]; then
+			bind_to_interface=$(ls "$net_path")
+		else
+			return 1
+		fi
+	fi
 
 	procd_open_instance "udp-encapsulation-tunnel"
 	procd_set_param command /usr/bin/udp-encapsulation-tunnel --interface $interface --listen-port $listen_port --bind-to-interface $bind_to_interface
