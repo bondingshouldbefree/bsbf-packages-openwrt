@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=10
+
+start_service() {
+	config_load "mptcpd"
+	local enabled
+	config_get_bool enabled "config" "enabled" "0"
+	[ "$enabled" -eq "1" ] || return 1
+	local log
+	local plugin_dir
+	local addr_flags
+	local notify_flags
+	local load_plugins
+	config_get log "config" "log"
+	config_get plugin_dir "config" "plugin_dir"
+	config_get addr_flags "config" "addr_flags"
+	config_get notify_flags "config" "notify_flags"
+	config_get load_plugins "config" "load_plugins"
+
+	procd_open_instance
+	procd_set_param command /usr/bin/mptcpd --log $log --plugin-dir $plugin_dir --addr-flags $addr_flags --notify-flags $notify_flags --load-plugins $load_plugins
+	procd_set_param respawn
+	procd_close_instance
+}
