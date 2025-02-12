@@ -1,0 +1,150 @@
+diff --git a/etc/mptcpd.conf.in b/etc/mptcpd.conf.in
+index e33ab4f..b0ff8c9 100644
+--- a/etc/mptcpd.conf.in
++++ b/etc/mptcpd.conf.in
+@@ -77,3 +77,10 @@ path-manager=@mptcpd_default_pm@
+ # A comma separated list containing one or more plugins to load.
+ #
+ # load-plugins=addr_adv,sspi
++
++# --------------------------
++# Interface to ignore
++# --------------------------
++# Name of network interface to ignore when advertising addresses
++#
++# ignore-interface=eth0
+diff --git a/include/mptcpd/private/configuration.h b/include/mptcpd/private/configuration.h
+index 9e3eafb..9d29a70 100644
+--- a/include/mptcpd/private/configuration.h
++++ b/include/mptcpd/private/configuration.h
+@@ -68,6 +68,8 @@ struct mptcpd_config
+ 
+         /// A list of plugins to load.
+         struct l_queue *plugins_to_load;
++
++        char *ignore_interface;  // Name of interface to ignore
+ };
+ 
+ /**
+diff --git a/plugins/path_managers/addr_adv.c b/plugins/path_managers/addr_adv.c
+index cfb66d4..2b79ed3 100644
+--- a/plugins/path_managers/addr_adv.c
++++ b/plugins/path_managers/addr_adv.c
+@@ -69,6 +69,11 @@ static void addr_adv_new_local_address(struct mptcpd_interface const *i,
+                                        struct sockaddr const *sa,
+                                        struct mptcpd_pm *pm)
+ {
++        // Check if this interface should be ignored
++        if (pm->config->ignore_interface != NULL 
++            && strcmp(i->name, pm->config->ignore_interface) == 0)
++                return;
++
+         struct mptcpd_idm *const idm = mptcpd_pm_get_idm(pm);
+         mptcpd_aid_t const id = mptcpd_idm_get_id(idm, sa);
+ 
+@@ -90,6 +95,11 @@ static void addr_adv_delete_local_address(
+         struct sockaddr const *sa,
+         struct mptcpd_pm *pm)
+ {
++        // Check if this interface should be ignored
++        if (pm->config->ignore_interface != NULL 
++            && strcmp(i->name, pm->config->ignore_interface) == 0)
++                return;
++
+         (void) i;
+ 
+         struct mptcpd_idm *const idm = mptcpd_pm_get_idm(pm);
+diff --git a/src/configuration.c b/src/configuration.c
+index e78c8b5..09cf315 100644
+--- a/src/configuration.c
++++ b/src/configuration.c
+@@ -363,6 +363,9 @@ static char const doc[] =
+ 
+ /// Command line option key for "--load-plugins"
+ #define MPTCPD_LOAD_PLUGINS_KEY 0x104
++
++/// Command line option key for "--ignore-interface"
++#define MPTCPD_IGNORE_INTERFACE_KEY 0x105
+ ///@}
+ 
+ static struct argp_option const options[] = {
+@@ -406,6 +409,12 @@ static struct argp_option const options[] = {
+           "Specify which plugins to load, e.g. --load-plugins=addr_adv,"
+           "sspi",
+           0 },
++        { "ignore-interface",
++          MPTCPD_IGNORE_INTERFACE_KEY,
++          "INTERFACE",
++          0,
++          "Name of network interface to ignore when advertising addresses",
++          0 },
+         { 0 }
+ };
+ 
+@@ -456,6 +465,14 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
+ 
+                 set_plugins_to_load(config, l_strdup(arg));
+                 break;
++        case MPTCPD_IGNORE_INTERFACE_KEY:
++                if (strlen(arg) == 0)
++                        argp_error(state,
++                                   "Empty ignore interface command"
++                                   "line option.");
++
++                reset_string(&config->ignore_interface, l_strdup(arg));
++                break;
+         default:
+                 return ARGP_ERR_UNKNOWN;
+         };
+@@ -635,6 +652,23 @@ static void parse_config_plugins_to_load(
+                 set_plugins_to_load(config, plugins_to_load);
+ }
+ 
++static void parse_config_ignore_interface(struct mptcpd_config *config,
++                                        struct l_settings const *settings,
++                                        char const *group)
++{
++        if (config->ignore_interface != NULL)
++                return;  // Previously set
++
++        char *const ignore_interface =
++                l_settings_get_string(settings,
++                                    group,
++                                    "ignore-interface");
++
++        if (ignore_interface != NULL) {
++                config->ignore_interface = ignore_interface;
++        }
++}
++
+ /**
+  * @brief Parse configuration file.
+  *
+@@ -679,6 +713,9 @@ static bool parse_config_file(struct mptcpd_config *config,
+ 
+                 // Plugins to load.
+                 parse_config_plugins_to_load(config, settings, group);
++
++                // Ignore interface.
++                parse_config_ignore_interface(config, settings, group);
+         } else {
+                 l_debug("Unable to load mptcpd settings from file '%s'",
+                         filename);
+@@ -771,6 +808,9 @@ static bool merge_config(struct mptcpd_config       *dst,
+                 }
+         }
+ 
++        if (dst->ignore_interface == NULL)
++                dst->ignore_interface = l_strdup(src->ignore_interface);
++
+         return true;
+ }
+ 
+@@ -874,6 +914,7 @@ void mptcpd_config_destroy(struct mptcpd_config *config)
+         l_queue_destroy(config->plugins_to_load, l_free);
+         l_free(config->default_plugin);
+         l_free(config->plugin_dir);
++        l_free(config->ignore_interface);
+         l_free(config);
+ }
+ 
