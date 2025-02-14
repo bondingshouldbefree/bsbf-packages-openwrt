@@ -12,11 +12,13 @@ start_service() {
 	local listen_port
 	local bind_to_interface
 	local bind_to_interface_of_device
+	local bind_to_interface_of_device_qmimux
 	local endpoint_port
 	config_get interface "config" "interface"
 	config_get listen_port "config" "listen_port"
 	config_get bind_to_interface "config" "bind_to_interface"
 	config_get bind_to_interface_of_device "config" "bind_to_interface_of_device"
+	config_get bind_to_interface_of_device_qmimux "config" "bind_to_interface_of_device_qmimux"
 	config_get endpoint_port "config" "endpoint_port"
 
 	# If bind_to_interface_of_device is set, use it to find the actual interface
@@ -25,6 +27,17 @@ start_service() {
 		net_path=$(find "$bind_to_interface_of_device" -type d -name "net")
 		if [ -n "$net_path" ]; then
 			bind_to_interface=$(ls "$net_path")
+		else
+			return 1
+		fi
+	fi
+
+	# If bind_to_interface_of_device_qmimux is set, use it to find the actual interface
+	if [ -n "$bind_to_interface_of_device_qmimux" ]; then
+		local net_path
+		net_path=$(find "$bind_to_interface_of_device_qmimux" -type d -name "net")
+		if [ -n "$net_path" ]; then
+			bind_to_interface="qmimux$(echo "$(ls "$net_path")" | sed 's/wwan//')"
 		else
 			return 1
 		fi

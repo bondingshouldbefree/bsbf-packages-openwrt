@@ -15,6 +15,7 @@ start_service() {
 	local load_plugins
 	local ignore_interface
 	local ignore_interface_of_device
+	local ignore_interface_of_device_qmimux
 	config_get log "config" "log"
 	config_get plugin_dir "config" "plugin_dir"
 	config_get addr_flags "config" "addr_flags"
@@ -22,6 +23,7 @@ start_service() {
 	config_get load_plugins "config" "load_plugins"
 	config_get ignore_interface "config" "ignore_interface"
 	config_get ignore_interface_of_device "config" "ignore_interface_of_device"
+	config_get ignore_interface_of_device_qmimux "config" "ignore_interface_of_device_qmimux"
 
 	# If ignore_interface_of_device is set, use it to find the actual interface
 	if [ -n "$ignore_interface_of_device" ]; then
@@ -29,6 +31,17 @@ start_service() {
 		net_path=$(find "$ignore_interface_of_device" -type d -name "net")
 		if [ -n "$net_path" ]; then
 			ignore_interface=$(ls "$net_path")
+		else
+			return 1
+		fi
+	fi
+
+	# If ignore_interface_of_device_qmimux is set, use it to find the actual interface
+	if [ -n "$ignore_interface_of_device_qmimux" ]; then
+		local net_path
+		net_path=$(find "$ignore_interface_of_device_qmimux" -type d -name "net")
+		if [ -n "$net_path" ]; then
+			ignore_interface="qmimux$(echo "$(ls "$net_path")" | sed 's/wwan//')"
 		else
 			return 1
 		fi
