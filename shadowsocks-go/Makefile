@@ -15,7 +15,7 @@ PKG_BUILD_PARALLEL:=1
 PKG_BUILD_FLAGS:=no-mips16
 
 GO_PKG:=github.com/database64128/shadowsocks-go/cmd/shadowsocks-go
-GO_PKG_BUILD_PKG:=$(GO_PKG)/main
+GO_PKG_BUILD_PKG:=$(GO_PKG)
 GO_PKG_LDFLAGS_X:= \
 	$(GO_PKG).build=OpenWrt \
 	$(GO_PKG).version=$(PKG_VERSION)
@@ -38,10 +38,8 @@ endef
 define Package/shadowsocks-go/install
 	$(call GoPackage/Package/Install/Bin,$(PKG_INSTALL_DIR))
 	$(INSTALL_DIR) $(1)/usr/bin/
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/main $(1)/usr/bin/shadowsocks-go
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/shadowsocks-go $(1)/usr/bin/shadowsocks-go
 
-	$(INSTALL_DIR) $(1)/etc/config/
-	$(INSTALL_CONF) $(CURDIR)/files/shadowsocks-go.conf $(1)/etc/config/shadowsocks-go
 	$(INSTALL_DIR) $(1)/etc/init.d/
 	$(INSTALL_BIN) $(CURDIR)/files/shadowsocks-go.init $(1)/etc/init.d/shadowsocks-go
 endef
