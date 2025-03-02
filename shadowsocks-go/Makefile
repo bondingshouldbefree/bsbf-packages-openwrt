@@ -3,12 +3,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=shadowsocks-go
-PKG_VERSION:=1.12.0
+PKG_VERSION:=main
 PKG_RELEASE:=1
 
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://codeload.github.com/database64128/shadowsocks-go/tar.gz/v$(PKG_VERSION)?
-PKG_HASH:=745ca9c2472175bc255743d2fb15336ad164463b58e0facb0039a441a40db82f
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/database64128/shadowsocks-go.git
+PKG_SOURCE_VERSION:=main
 
 PKG_BUILD_DEPENDS:=golang/host
 PKG_BUILD_PARALLEL:=1
