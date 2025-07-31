@@ -78,23 +78,23 @@ define Package/comgt/install
 	$(INSTALL_DATA) ./files/runcommand.gcom $(1)/etc/gcom/runcommand.gcom
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/tty
 	$(INSTALL_CONF) ./files/3g.usb $(1)/etc/hotplug.d/tty/30-3g
-	$(INSTALL_DIR) $(1)/lib/netifd/proto
-	$(INSTALL_BIN) ./files/3g.sh $(1)/lib/netifd/proto/3g.sh
+	$(INSTALL_DIR) $(1)/usr/local/usr/lib/netifd/proto
+	$(INSTALL_BIN) ./files/3g.sh $(1)/usr/local/usr/lib/netifd/proto/3g.sh
 endef
 
 define Package/comgt-directip/install
 	$(INSTALL_DIR) $(1)/etc/gcom
 	$(INSTALL_DATA) ./files/directip.gcom $(1)/etc/gcom/directip.gcom
 	$(INSTALL_DATA) ./files/directip-stop.gcom $(1)/etc/gcom/directip-stop.gcom
-	$(INSTALL_DIR) $(1)/lib/netifd/proto
-	$(INSTALL_BIN) ./files/directip.sh $(1)/lib/netifd/proto/directip.sh
+	$(INSTALL_DIR) $(1)/usr/local/usr/lib/netifd/proto
+	$(INSTALL_BIN) ./files/directip.sh $(1)/usr/local/usr/lib/netifd/proto/directip.sh
 endef
 
 define Package/comgt-ncm/install
 	$(INSTALL_DIR) $(1)/etc/gcom
 	$(INSTALL_DATA) ./files/ncm.json $(1)/etc/gcom/ncm.json
-	$(INSTALL_DIR) $(1)/lib/netifd/proto
-	$(INSTALL_BIN) ./files/ncm.sh $(1)/lib/netifd/proto/ncm.sh
+	$(INSTALL_DIR) $(1)/usr/local/usr/lib/netifd/proto
+	$(INSTALL_BIN) ./files/ncm.sh $(1)/usr/local/usr/lib/netifd/proto/ncm.sh
 endef
 
 $(eval $(call BuildPackage,comgt))
