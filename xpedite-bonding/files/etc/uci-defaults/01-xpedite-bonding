@@ -1,0 +1,14 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+# DHCP Configuration
+uci add_list dhcp.lan.dhcp_option='6,1.1.1.1,1.0.0.1'
+
+# sing-box Configuration
+uci delete sing-box.main.user
+uci set sing-box.main.enabled='1'
+
+# Commit all changes
+uci commit dhcp
+uci commit sing-box

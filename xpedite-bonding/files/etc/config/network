@@ -1,0 +1,49 @@
+
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+config globals 'globals'
+
+config interface 'lan'
+	option device 'lan4'
+	option proto 'static'
+	option ipaddr '192.168.4.1'
+	option netmask '255.255.255.0'
+
+config interface 'wan1'
+	option proto 'dhcp'
+	option device 'wan'
+	option peerdns '0'
+	option metric '1'
+
+config interface 'wan2'
+	option proto 'dhcp'
+	option device 'lan1'
+	option peerdns '0'
+	option metric '2'
+
+config interface 'wan3'
+	option proto 'dhcp'
+	option device 'lan2'
+	option peerdns '0'
+	option metric '3'
+
+config interface 'wan4'
+	option proto 'dhcp'
+	option device 'lan3'
+	option peerdns '0'
+	option metric '4'
+
+config rule
+	option priority '0'
+	option lookup '100'
+	option mark '1'
+
+config route
+	option interface 'loopback'
+	option type 'local'
+	option target '0.0.0.0/0'
+	option table '100'
