@@ -1,0 +1,580 @@
+# This script provides the BondingShouldBeFree bonding solution.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+# Get the interface of lan network.
+lan_network_interface="$(uci get network.lan.device)"
+
+# If LAN is a bridge, get its members.
+if echo "$lan_network_interface" | grep -q '^br'; then
+	lan_interfaces="$(uci get network.@device[0].ports)"
+
+	# Set biggest number interface as lan network.
+	lan_network_interface="$(echo $lan_interfaces | tr ' ' '\n' | grep '[0-9]\+$' | sort -V | tail -n1)"
+	uci set network.lan.device="$lan_network_interface"
+
+	# Remove bridge interface.
+	uci delete network.@device[0]
+fi
+uci set network.lan.ipaddr='192.168.4.1'
+
+# Get the interface of wan network. It won't be a bridge.
+wan_network_interface="$(uci get network.wan.device)"
+
+# Add a wan network entry for wan network's interface and lan network
+# interfaces other than the one used for lan, if there are any.
+wan_candidates="$wan_network_interface $(echo $lan_interfaces | tr ' ' '\n' | grep -v "^$lan_network_interface$")"
+
+# Delete existing wan and wan6 networks.
+uci delete network.wan
+uci delete network.wan6
+
+index=1
+for dev in $wan_candidates; do
+	[ -z "$dev" ] && continue
+
+	uci set network.wan$index=interface
+	uci set network.wan$index.device="$dev"
+	uci set network.wan$index.proto='dhcp'
+	uci set network.wan$index.peerdns='0'
+	uci set network.wan$index.metric="$index"
+
+	# Add every wan network entry to firewall wan zone.
+	uci add_list firewall.@zone[1].network="wan$index"
+
+	index=$((index + 1))
+done
+
+# DHCP and DNS Configuration
+uci add_list dhcp.lan.dhcp_option='6,1.1.1.1,1.0.0.1'
+uci add_list dhcp.@dnsmasq[0].server='8.8.8.8'
+
+# Add rule to use routing table 100 for transparent proxy traffic.
+uci add network rule
+uci set network.@rule[-1].priority='0'
+uci set network.@rule[-1].lookup='100'
+uci set network.@rule[-1].mark='1'
+
+# Add route to route transparent proxy traffic to the loopback interface.
+uci add network route
+uci set network.@route[-1].interface='loopback'
+uci set network.@route[-1].type='local'
+uci set network.@route[-1].target='0.0.0.0/0'
+uci set network.@route[-1].table='100'
+
+# bsbf-bonding
+cat <<'EOF' > /etc/mptcpd/mptcpd.conf
+[core]
+log=syslog
+plugin-dir=/usr/lib/mptcpd
+addr-flags=subflow
+notify-flags=skip_link_local,skip_loopback,check_route
+load-plugins=addr_adv
+EOF
+
+cat <<'EOF' > /etc/nftables.d/proxy.nft
+set proxy_byp4 {
+	typeof ip daddr
+	flags interval
+	elements = { 0.0.0.0/8, 10.0.0.0/8,
+		     100.64.0.0/10, 127.0.0.0/8,
+		     169.254.0.0/16, 172.16.0.0/12,
+		     192.0.0.0/24, 192.0.2.0/24,
+		     192.88.99.0/24, 192.168.0.0/16,
+		     198.18.0.0/15, 198.51.100.0/24,
+		     203.0.113.0/24, 224.0.0.0/4,
+		     240.0.0.0/4 }
+}
+
+chain proxy_prerouting {
+	type filter hook prerouting priority mangle + 1; policy accept;
+	ip daddr @proxy_byp4 return
+	fib daddr type != local meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:12345 meta mark set 0x00000001
+}
+EOF
+
+if command -v sing-box; then
+	cat <<'EOF' > /etc/sing-box/config.json
+{
+  "log": {
+    "level": "error"
+  },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "listen": "127.0.0.1",
+      "listen_port": 12345
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vmess",
+      "server": "",
+      "server_port": null,
+      "uuid": "",
+      "security": "zero",
+      "tcp_multi_path": true,
+      "routing_mark": 2
+    }
+  ]
+}
+EOF
+	uci delete sing-box.main.user
+	uci set sing-box.main.enabled='1'
+else
+	cat <<'EOF' > /etc/v2ray/config.json
+{
+  "log": {
+    "loglevel": "error"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 12345,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp,udp",
+        "followRedirect": true
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tproxy": "tproxy"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "",
+            "port": null,
+            "users": [
+              {
+                "id": "",
+                "security": "zero"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "sockopt": {
+          "mark": 2,
+          "mptcp": true
+        }
+      },
+      "mux": {
+        "enabled": true,
+        "concurrency": 8
+      }
+    }
+  ]
+}
+EOF
+	uci set v2ray.enabled.enabled='1'
+fi
+
+# Commit all changes.
+uci commit
+
+# bsbf-cdc-ether
+cat <<'EOF' > /etc/hotplug.d/usb/99-bsbf-cdc-ether
+#!/bin/sh
+
+[ "$ACTION" = "bind" ] && [ "$DEVTYPE" = "usb_interface" ] && bsbf-cdc-ether
+EOF
+
+cat <<'EOF' > /etc/init.d/bsbf-cdc-ether
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance "bsbf-cdc-ether"
+	procd_set_param command "/usr/sbin/bsbf-cdc-ether"
+	procd_close_instance
+}
+EOF
+chmod +x /etc/init.d/bsbf-cdc-ether
+
+cat <<'EOF' > /usr/sbin/bsbf-cdc-ether
+#!/bin/sh
+# This script sets up a CDC-ECM modem.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+for IFACE in /sys/bus/usb/devices/*:*; do
+	class=$(cat $IFACE/bInterfaceClass)
+	subclass=$(cat $IFACE/bInterfaceSubClass)
+	[ "$class" = "02" ] && [ "$subclass" = "06" ] || continue
+
+	NETDEV="$(ls $IFACE/net)"
+	uci set network.pluggable_modem=interface
+	uci set network.pluggable_modem.device="$NETDEV"
+	uci set network.pluggable_modem.proto='dhcp'
+	uci set network.pluggable_modem.metric='9'
+	uci set network.pluggable_modem.auto='0'
+	uci commit network
+	ifup pluggable_modem
+done
+EOF
+chmod +x /usr/sbin/bsbf-cdc-ether
+
+# bsbf-fusionlink
+cat <<'EOF' > /etc/init.d/bsbf-fusionlink
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance "bsbf-fusionlink"
+	procd_set_param command "/usr/sbin/bsbf-fusionlink"
+	procd_close_instance
+}
+EOF
+chmod +x /etc/init.d/bsbf-fusionlink
+
+cat <<'EOF' > /usr/sbin/bsbf-fusionlink
+#!/bin/sh
+# This script configures sing-box or v2ray when there's access to Google.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+TIMEOUT_MS=900
+COUNT=3
+SERVER_IP=8.8.8.8
+INTERVAL=1
+
+until fping -q -t "$TIMEOUT_MS" -c "$COUNT" "$SERVER_IP"; do
+	sleep "$INTERVAL"
+done
+
+if command -v sing-box; then
+	curl -s -X POST http://102.132.169.58:7988/getFusionlinkConfigSingBox \
+		-H "Content-Type: application/json" \
+		-d '{"ip": "$(curl ifconfig.me)"}' \
+		-o /etc/sing-box/config.json
+
+	service sing-box restart
+else
+	curl -s -X POST http://102.132.169.58:7988/getFusionlinkConfigV2ray \
+		-H "Content-Type: application/json" \
+		-d '{"ip": "$(curl ifconfig.me)"}' \
+		-o /etc/sing-box/config.json
+
+	service v2ray restart
+fi
+EOF
+chmod +x /usr/sbin/bsbf-fusionlink
+
+# bsbf-mptcp-helper
+cat <<'EOF' > /etc/config/bsbf-mptcp-helper
+config endpoints 'main'
+#	list subflow_backup 'example'
+EOF
+
+cat <<'EOF' > /etc/hotplug.d/iface/99-bsbf-mptcp-backup
+#!/bin/sh
+# This script checks UCI configuration to make the endpoint of an interface a
+# backup subflow on ifup.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+[ "$ACTION" = "ifup" ] || exit
+
+uci get bsbf-mptcp-helper.main.subflow_backup | grep -w "$DEVICE" && bsbf-mptcp-helper backup "$DEVICE"
+EOF
+
+cat <<'EOF' > /etc/hotplug.d/iface/99-bsbf-mptcp-remove
+#!/bin/sh
+# This script calls the mptcp helper to remove the endpoint of an interface on
+# ifdown. This is a workaround to remove the endpoint when an Ethernet cable or
+# an interface is removed. The implementation works around the current behaviour
+# that is the DEVICE variable not being reported on ifdown.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+[ "$ACTION" = "ifdown" ] || exit
+
+DEVICE=$(ubus call network.interface."$INTERFACE" status | grep -m1 '"device"' | cut -d'"' -f4)
+
+bsbf-mptcp-helper remove "$DEVICE"
+EOF
+
+cat <<'EOF' > /etc/init.d/bsbf-mptcp-backup
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance "bsbf-mptcp-backup"
+	procd_set_param command "/usr/sbin/bsbf-mptcp-backup"
+	procd_close_instance
+}
+EOF
+chmod +x /etc/init.d/bsbf-mptcp-backup
+
+# bsbf-netspeed
+cat <<'EOF' > /usr/sbin/bsbf-netspeed
+#!/bin/sh
+# This script displays the download and upload throughput of a specified
+# interface(s) at a specified interval.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+if [ "$#" -lt 2 ]; then
+	echo "usage: $0 <interval> <interface> [<interface> ...]"
+	exit 1
+fi
+
+INTERVAL="$1"
+shift
+
+read_bytes() {
+	cat /sys/class/net/"$1"/statistics/"$2"_bytes 2>/dev/null || echo 0
+}
+
+while true; do
+	# first snapshot
+	for IFACE in "$@"; do
+		eval RX1_$IFACE=$(read_bytes "$IFACE" rx)
+		eval TX1_$IFACE=$(read_bytes "$IFACE" tx)
+	done
+
+	sleep "$INTERVAL"
+	clear
+
+	# second snapshot + output
+	for IFACE in "$@"; do
+		RX2=$(read_bytes "$IFACE" rx)
+		TX2=$(read_bytes "$IFACE" tx)
+
+		eval RX1=\$RX1_$IFACE
+		eval TX1=\$TX1_$IFACE
+
+		RX_DIFF=$((RX2 - RX1))
+		TX_DIFF=$((TX2 - TX1))
+
+		RX_Mbps=$(awk "BEGIN { printf \"%.1f\", ($RX_DIFF * 8) / ($INTERVAL * 1000000) }")
+		TX_Mbps=$(awk "BEGIN { printf \"%.1f\", ($TX_DIFF * 8) / ($INTERVAL * 1000000) }")
+
+		echo "$IFACE:"
+		echo "Download: $RX_Mbps Mbps"
+		echo "Upload:   $TX_Mbps Mbps"
+		echo
+	done
+done
+EOF
+chmod +x /usr/sbin/bsbf-netspeed
+
+# bsbf-route
+cat <<'EOF' > /etc/init.d/bsbf-route
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance "bsbf-route"
+	procd_set_param command "/usr/sbin/bsbf-route"
+	procd_close_instance
+}
+EOF
+chmod +x /etc/init.d/bsbf-route
+
+cat <<'EOF' > /usr/sbin/bsbf-route
+#!/bin/sh
+# This script changes the preferred route until there's access to Google.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+TIMEOUT_MS=900
+COUNT=3
+SERVER_IP=8.8.8.8
+INTERVAL=1
+
+while true; do
+	sleep "$INTERVAL"
+
+	# Get all default routes with a metric.
+	routes=$(ip route show | grep "^default" | grep "metric")
+
+	# Count the number of routes.
+	route_count=$(echo "$routes" | grep -c "metric")
+
+	# Continue if there are less than two routes.
+	[ "$route_count" -lt 2 ] && continue
+
+	fping -q -t "$TIMEOUT_MS" -c "$COUNT" "$SERVER_IP"
+	# Continue if there is connectivity.
+	[ $? -eq 0 ] && continue
+
+	# Get the first route.
+	r1=$(echo "$routes" | sed -n '1p')
+
+	# Get the last route.
+	r_last=$(echo "$routes" | tail -n 1)
+
+	# Extract metric from first route.
+	m1=$(echo "$r1" | grep -o "metric [0-9]*" | awk '{print $2}')
+
+	# Extract metric from last route.
+	m_last=$(echo "$r_last" | grep -o "metric [0-9]*" | awk '{print $2}')
+
+	# Extract interface from first route.
+	if1=$(echo "$r1" | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')
+
+	# Calculate new metric for first route (last route's metric + 1).
+	new_m1=$((m_last + 1))
+
+	logger -t bsbf-route "Ping fail; changing metric of $if1 from $m1 to $new_m1"
+
+	# Update the first route with the new metric.
+	ip route delete $r1
+	ip route add ${r1%metric*}metric "$new_m1"
+
+	# If metric value of last route reaches 100, reset value of all routes.
+	[ "$new_m1" -lt 100 ] && continue
+
+	logger -t bsbf-route "Metric value reached 100, resetting"
+	# Set base metric to 10 to prevent interfering with interfaces with
+	# lower metric at bring-up.
+	metric=10
+	ip route show | grep "^default" | grep "metric" | while read route; do
+		ip route add ${route%metric*}metric "$metric"
+		ip route delete $route
+		metric=$((metric + 1))
+	done
+done
+EOF
+chmod +x /usr/sbin/bsbf-route
+
+# bsbf-tcp-in-udp
+cat <<'EOF' > /etc/hotplug.d/iface/99-bsbf-tcp-in-udp
+#!/bin/sh
+
+[ "$ACTION" = "ifup" ] || exit
+
+case "$INTERFACE" in
+	wan*|wwan*|ifWan*|mob*_*|pluggable_modem)
+		[ "$DEVICE" = qmimux* ] && { bsbf-tcp-in-udp l3 "$DEVICE"; exit; }
+		bsbf-tcp-in-udp l2 "$DEVICE"
+		;;
+esac
+EOF
+
+mkdir -p /usr/local/share/tcp-in-udp
+cat <<'EOF' | base64 -d > /usr/local/share/tcp-in-udp/tcp_in_udp_tc.o
+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
+AgMEAC50ZXh0AC5sbHZtX2FkZHJzaWcAX2xpY2Vuc2UAdGMAdGNwX2luX3VkcF90Yy5jAC5zdHJ0
+YWIALnN5bXRhYgB0Y190Y3BfaW5fdWRwX2wzAHRjX2wzAHRjX3RjcF9pbl91ZHBfbDIAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAxAAAAAwAAAAAAAAAAAAAAAAAAAAAAAABDDgAAAAAAAGkAAAAAAAAAAAAAAAAAAAABAAAA
+AAAAAAAAAAAAAAAAAQAAAAEAAAAGAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAABAAAAAAAAAAAAAAAAAAAAB4AAAABAAAABgAAAAAAAAAAAAAAAAAAAEAAAAAAAAAA0AYAAAAA
+AAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAABSAAAAAQAAAAYAAAAAAAAAAAAAAAAAAAAQBwAAAAAA
+ALAGAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAFgAAAAEAAAADAAAAAAAAAAAAAAAAAAAA
+wA0AAAAAAAAEAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAcAAAADTP9vAAAAgAAAAAAA
+AAAAAAAAAEAOAAAAAAAAAwAAAAAAAAAHAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAA5AAAAAgAAAAAA
+AAAAAAAAAAAAAAAAAADIDQAAAAAAAHgAAAAAAAAAAQAAAAIAAAAIAAAAAAAAABgAAAAAAAAA
+EOF
+
+cat <<'EOF' > /usr/sbin/bsbf-tcp-in-udp
+#!/bin/sh
+# This script loads the TCP-in-UDP BPF programme to a specified interface.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+if [ $# -ne 2 ] || { [ "$1" != "l2" ] && [ "$1" != "l3" ]; }; then
+    echo "Usage: $0 l2|l3 <interface>"
+    exit 1
+fi
+
+SEC="tc"
+if [ "$1" = "l3" ]; then
+    SEC="tc_l3"
+fi
+
+IFACE="$2"
+PROGRAMME=/usr/local/share/tcp-in-udp/tcp_in_udp_tc.o
+
+ip link set "$IFACE" mtu 1408 && \
+ethtool -K "$IFACE" gro off 2>/dev/null && \
+ip link set "$IFACE" gso_max_segs 0 && \
+tc qdisc del dev "$IFACE" clsact 2>/dev/null ; \
+tc qdisc replace dev "$IFACE" clsact && \
+tc filter add dev "$IFACE" egress handle 2 fw action goto chain 1 && \
+tc filter add dev "$IFACE" egress chain 1 bpf object-file "$PROGRAMME" section "$SEC" action csum udp && \
+tc filter add dev "$IFACE" ingress u32 match ip sport 31001 0xffff action goto chain 1 && \
+tc filter add dev "$IFACE" ingress u32 match ip sport 31002 0xffff action goto chain 1 && \
+tc filter add dev "$IFACE" ingress u32 match ip sport 31003 0xffff action goto chain 1 && \
+tc filter add dev "$IFACE" ingress chain 1 bpf object-file "$PROGRAMME" section "$SEC" direct-action
+EOF
+chmod +x /usr/sbin/bsbf-tcp-in-udp
+
+# Enable and start new services.
+/etc/init.d/bsbf-cdc-ether enable && /etc/init.d/bsbf-cdc-ether start
+/etc/init.d/bsbf-fusionlink enable && /etc/init.d/bsbf-fusionlink start
+/etc/init.d/bsbf-mptcp-backup enable && /etc/init.d/bsbf-mptcp-backup start
+/etc/init.d/bsbf-route enable && /etc/init.d/bsbf-route start
