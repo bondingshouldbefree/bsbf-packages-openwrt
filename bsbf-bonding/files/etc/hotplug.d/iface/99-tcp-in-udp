@@ -1,0 +1,20 @@
+#!/bin/sh
+
+case "$ACTION" in
+	ifup)
+		case "$INTERFACE" in
+			wan*)
+				tcp-in-udp l2 "$DEVICE"
+				;;
+			lan1)
+				tcp-in-udp l2 "$DEVICE"
+				;;
+			lan2)
+				tcp-in-udp l2 "$DEVICE"
+				;;
+			lan3)
+				tcp-in-udp l2 "$DEVICE"
+				;;
+		esac
+		;;
+esac
