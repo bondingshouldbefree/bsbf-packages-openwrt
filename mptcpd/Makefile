@@ -4,7 +4,7 @@ PKG_NAME:=mptcpd
 PKG_VERSION:=0.13
 PKG_RELEASE:=1
 
-PKG_SOURCE:=mptcpd-$(PKG_VERSION).tar.gz
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/multipath-tcp/mptcpd/releases/download/v$(PKG_VERSION)
 PKG_HASH:=7acb115c50c89aff5e0e5c53df4aef5c9846e79b32442f8700ff6d737396edab
 
@@ -50,8 +50,6 @@ define Package/mptcpd/install
 	$(INSTALL_DIR) $(1)/usr/lib/mptcpd
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/libmptcpd.so* $(1)/usr/lib
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/mptcpd/*.so $(1)/usr/lib/mptcpd
-	$(INSTALL_DIR) $(1)/etc/config/
-	$(INSTALL_CONF) ./files/mptcpd.conf $(1)/etc/config/mptcpd
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/mptcpd.init $(1)/etc/init.d/mptcpd
 endef
