@@ -1,0 +1,38 @@
+#!/bin/sh
+# This script loads the TCP-in-UDP BPF programme to a specified interface.
+#
+# Regarding matching packets for the TCP-in-UDP BPF programme, use fwmark for
+# egress to prevent processing traffic that is not from the TCP programme. For
+# client, this allows traffic to a different IP address with the same TCP port.
+# For server, this prevents sending packet to BPF programme if the interface has
+# multiple IP addresses assigned and if the TCP programme doesn't bind to all of
+# them.
+#
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+if [ $# -ne 2 ] || { [ "$1" != "l2" ] && [ "$1" != "l3" ]; }; then
+    echo "Usage: $0 l2|l3 <interface>"
+    exit 1
+fi
+
+SEC="tc"
+if [ "$1" = "l3" ]; then
+    SEC="tc_l3"
+fi
+
+IFACE="$2"
+PROGRAMME=/usr/local/share/tcp-in-udp/tcp_in_udp_tc.o
+
+# Lowering MTU is necessary for UDP conversion to work. 1408 works on all ISPs
+# so far.
+ip link set "$IFACE" mtu 1408 && \
+ethtool -K "$IFACE" gro off 2>/dev/null && \
+ip link set "$IFACE" gso_max_segs 0 && \
+tc qdisc del dev "$IFACE" clsact 2>/dev/null ; \
+tc qdisc replace dev "$IFACE" clsact && \
+tc filter add dev "$IFACE" egress handle 2 fw action goto chain 1 && \
+tc filter add dev "$IFACE" egress chain 1 bpf object-file "$PROGRAMME" section "$SEC" action csum udp && \
+tc filter add dev "$IFACE" ingress u32 match ip sport 31001 0xffff action goto chain 1 && \
+tc filter add dev "$IFACE" ingress u32 match ip sport 31002 0xffff action goto chain 1 && \
+tc filter add dev "$IFACE" ingress u32 match ip sport 31003 0xffff action goto chain 1 && \
+tc filter add dev "$IFACE" ingress chain 1 bpf object-file "$PROGRAMME" section "$SEC" direct-action

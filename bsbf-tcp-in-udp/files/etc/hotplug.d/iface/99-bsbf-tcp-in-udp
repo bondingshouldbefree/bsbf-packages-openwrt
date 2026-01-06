@@ -1,0 +1,10 @@
+#!/bin/sh
+
+[ "$ACTION" = "ifup" ] || exit
+
+case "$INTERFACE" in
+	wan*|wwan*|ifWan*|mob*_*)
+		[ "$DEVICE" = qmimux* ] && { bsbf-tcp-in-udp l3 "$DEVICE"; exit; }
+		bsbf-tcp-in-udp l2 "$DEVICE"
+		;;
+esac
