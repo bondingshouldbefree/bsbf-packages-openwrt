@@ -1,0 +1,42 @@
+#!/bin/sh
+# This script changes usbnet mode on Quectel modems to MBIM and then reboots the system.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+read_usbnet_response() {
+	cat "$DEVICE" > /tmp/bsbf-quectel-usbnet-response.txt &
+	CAT_PID=$!
+	echo -ne 'AT+QCFG="usbnet"\r' > "$DEVICE"
+	sleep 3
+	kill $CAT_PID
+	RESPONSE=$(tr '\r\n' ' ' < /tmp/bsbf-quectel-usbnet-response.txt)
+	rm /tmp/bsbf-quectel-usbnet-response.txt
+}
+
+for DEVICE in /dev/ttyUSB3 /dev/ttyUSB7 /dev/ttyUSB11; do
+	for i in $(seq 1 5); do
+		[ -e "$DEVICE" ] && break
+		sleep 3
+		[ $i -eq 5 ] && break 2
+	done
+
+	for i in $(seq 1 5); do
+		read_usbnet_response
+
+		if echo "$RESPONSE" | grep -q '+QCFG: "usbnet",2'; then
+			logger -t bsbf-quectel-usbnet "Modem on $DEVICE is already in MBIM mode."
+			break
+		elif echo "$RESPONSE" | grep -qE '\+QCFG: "usbnet",(0|1)'; then
+			logger -t bsbf-quectel-usbnet "Modem on $DEVICE is not in MBIM mode. Switching to MBIM mode."
+			echo -ne 'AT+QCFG="usbnet",2\r' > "$DEVICE"
+			reboot=1
+			break
+		elif [ $i -eq 5 ]; then
+			logger -t bsbf-quectel-usbnet "Unexpected response from modem on $DEVICE. Exiting. Response: $RESPONSE"
+			break
+		else
+			logger -t bsbf-quectel-usbnet "Modem on $DEVICE may not be in MBIM mode. Checking again. Response: $RESPONSE"
+		fi
+	done
+done
+
+[ "$reboot" -eq 1 ] && reboot
