@@ -1,0 +1,28 @@
+#!/bin/sh
+# This script configures sing-box or v2ray when there's access to Google.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+TIMEOUT_MS=900
+COUNT=3
+SERVER_IP=8.8.8.8
+INTERVAL=0.3
+
+until fping -q -t "$TIMEOUT_MS" -c "$COUNT" "$SERVER_IP"; do
+	sleep "$INTERVAL"
+done
+
+if command -v sing-box; then
+	curl -s -X POST http://102.132.169.58:7988/getFusionlinkConfigSingBox \
+		-H "Content-Type: application/json" \
+		-d '{"ip": "$(curl ifconfig.me)"}' \
+		-o /etc/sing-box/config.json
+
+	service sing-box restart
+else
+	curl -s -X POST http://102.132.169.58:7988/getFusionlinkConfigV2ray \
+		-H "Content-Type: application/json" \
+		-d '{"ip": "$(curl ifconfig.me)"}' \
+		-o /etc/sing-box/config.json
+
+	service v2ray restart
+fi
