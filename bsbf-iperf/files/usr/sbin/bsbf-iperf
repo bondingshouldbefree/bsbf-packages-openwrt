@@ -1,0 +1,15 @@
+#!/bin/sh
+# This script starts a simultaneous speed test using two interfaces.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+(
+	iperf3 -c 102.132.201.141 -p 31010 -R --bind-dev eth1 -Z --logfile /usr/local/home/root/bsbf-iperf-eth1.log &&
+	sleep 1 &&
+	iperf3 -c 102.132.201.141 -p 31010 --bind-dev eth1 -Z --logfile /usr/local/home/root/bsbf-iperf-eth1.log
+) &
+
+(
+	iperf3 -c 102.132.201.141 -p 31011 -R --bind-dev qmimux0 -Z --logfile /usr/local/home/root/bsbf-iperf-qmimux0.log &&
+	sleep 1 &&
+	iperf3 -c 102.132.201.141 -p 31011 --bind-dev qmimux0 -Z --logfile /usr/local/home/root/bsbf-iperf-qmimux0.log
+)
