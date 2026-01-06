@@ -1,0 +1,63 @@
+#!/bin/sh
+# This script changes the preferred route until there's access to a given IPv4
+# address.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+TIMEOUT_MS=900
+COUNT=3
+SERVER_IP=8.8.8.8
+INTERVAL=0.3
+
+while true; do
+	sleep "$INTERVAL"
+
+	# Get all default routes with a metric.
+	routes=$(ip route show | grep "^default" | grep "metric")
+
+	# Count the number of routes.
+	route_count=$(echo "$routes" | grep -c "metric")
+
+	# Continue if there are less than two routes.
+	[ "$route_count" -lt 2 ] && continue
+
+	fping -q -t "$TIMEOUT_MS" -c "$COUNT" "$SERVER_IP"
+	# Continue if there is connectivity.
+	[ $? -eq 0 ] && continue
+
+	# Get the first route.
+	r1=$(echo "$routes" | sed -n '1p')
+
+	# Get the last route.
+	r_last=$(echo "$routes" | tail -n 1)
+
+	# Extract metric from first route.
+	m1=$(echo "$r1" | grep -o "metric [0-9]*" | awk '{print $2}')
+
+	# Extract metric from last route.
+	m_last=$(echo "$r_last" | grep -o "metric [0-9]*" | awk '{print $2}')
+
+	# Extract interface from first route.
+	if1=$(echo "$r1" | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')
+
+	# Calculate new metric for first route (last route's metric + 1).
+	new_m1=$((m_last + 1))
+
+	logger -t bsbf-route "Ping fail; changing metric of $if1 from $m1 to $new_m1"
+
+	# Update the first route with the new metric.
+	ip route delete $r1
+	ip route add ${r1%metric*}metric "$new_m1"
+
+	# If metric value of last route reaches 100, reset value of all routes.
+	[ "$new_m1" -lt 100 ] && continue
+
+	logger -t bsbf-route "Metric value reached 100, resetting"
+	# Set base metric to 10 to prevent interfering with interfaces with
+	# lower metric at bring-up.
+	metric=10
+	ip route show | grep "^default" | grep "metric" | while read route; do
+		ip route add ${route%metric*}metric "$metric"
+		ip route delete $route
+		metric=$((metric + 1))
+	done
+done
