@@ -1,0 +1,47 @@
+#!/bin/sh
+# This script displays the download and upload throughput of a specified
+# interface(s) at a specified interval.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+if [ "$#" -lt 2 ]; then
+	echo "usage: $0 <interval> <interface> [<interface> ...]"
+	exit 1
+fi
+
+INTERVAL="$1"
+shift
+
+read_bytes() {
+	cat /sys/class/net/"$1"/statistics/"$2"_bytes 2>/dev/null || echo 0
+}
+
+while true; do
+	# first snapshot
+	for IFACE in "$@"; do
+		eval RX1_$IFACE=$(read_bytes "$IFACE" rx)
+		eval TX1_$IFACE=$(read_bytes "$IFACE" tx)
+	done
+
+	sleep "$INTERVAL"
+	clear
+
+	# second snapshot + output
+	for IFACE in "$@"; do
+		RX2=$(read_bytes "$IFACE" rx)
+		TX2=$(read_bytes "$IFACE" tx)
+
+		eval RX1=\$RX1_$IFACE
+		eval TX1=\$TX1_$IFACE
+
+		RX_DIFF=$((RX2 - RX1))
+		TX_DIFF=$((TX2 - TX1))
+
+		RX_Mbps=$(awk "BEGIN { printf \"%.1f\", ($RX_DIFF * 8) / ($INTERVAL * 1000000) }")
+		TX_Mbps=$(awk "BEGIN { printf \"%.1f\", ($TX_DIFF * 8) / ($INTERVAL * 1000000) }")
+
+		echo "$IFACE:"
+		echo "Download: $RX_Mbps Mbps"
+		echo "Upload:   $TX_Mbps Mbps"
+		echo
+	done
+done
