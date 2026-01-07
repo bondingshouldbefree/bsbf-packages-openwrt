@@ -1,0 +1,8 @@
+#!/bin/sh
+# This script checks UCI configuration to make the endpoint of an interface a
+# backup subflow on ifup.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+[ "$ACTION" = "ifup" ] || exit
+
+uci get bsbf-mptcp-helper.main.subflow_backup | grep -w "$DEVICE" && bsbf-mptcp-helper backup "$DEVICE"

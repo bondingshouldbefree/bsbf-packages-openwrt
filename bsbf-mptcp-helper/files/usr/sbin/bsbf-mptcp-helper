@@ -1,0 +1,23 @@
+#!/bin/sh
+# The remove part of this script removes the mptcp endpoint of a given interface
+# and/or a removed interface. The backup part changes the mptcp endpoint of a
+# given interface to a backup subflow.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+if [ $# -ne 2 ] || { [ "$1" != "backup" ] && [ "$1" != "nobackup" ] && [ "$1" != "remove" ]; }; then
+	echo "usage: $0 backup|nobackup|remove <interface>"
+	exit 1
+fi
+
+# Extract MPTCP endpoint ID from interface.
+ID=$(ip mp e | awk -v dev="$2" '$NF == dev {for(i=1;i<=NF;i++) if($i=="id") print $(i+1)}')
+
+# Change the affine endpoint accordingly and exit.
+{ [ "$1" = "backup" ] || [ "$1" = "nobackup" ]; } && { ip mp e c i "$ID" "$1" ; exit; }
+
+# Remove endpoint if the ID of the interface is found and exit.
+[ -n "$ID" ] && ip mp e d i "$ID" && exit
+
+# Remove endpoint if there's one with a removed interface.
+ID=$(ip mp e | awk '$0 ~ /if/ {for(i=1;i<=NF;i++){if($i=="id"){print $(i+1)}}}')
+[ -n "$ID" ] && ip mp e d i "$ID"

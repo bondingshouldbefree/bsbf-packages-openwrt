@@ -1,0 +1,12 @@
+#!/bin/sh
+# This script calls the mptcp helper to remove the endpoint of an interface on
+# ifdown. This is a workaround to remove the endpoint when an Ethernet cable or
+# an interface is removed. The implementation works around the current behaviour
+# that is the DEVICE variable not being reported on ifdown.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+[ "$ACTION" = "ifdown" ] || exit
+
+DEVICE=$(ubus call network.interface."$INTERFACE" status | grep -m1 '"device"' | cut -d'"' -f4)
+
+bsbf-mptcp-helper remove "$DEVICE"
