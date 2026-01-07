@@ -1,0 +1,74 @@
+#!/bin/sh
+# This script pings a given IPv4 address a given amount of times on an
+# interface(s) which is a default route. Depending on the average round-trip
+# time, it makes the interface a backup subflow.
+# Author: Chester A. Unal <chester.a.unal@arinc9.com>
+
+TIMEOUT_MS=900
+COUNT=3
+SERVER_IP=8.8.8.8
+INTERVAL=0.3
+THRESHOLD_PERCENT=200
+
+while true; do
+	sleep "$INTERVAL"
+
+	# Get all default routes with a metric.
+	routes=$(ip route show | grep "^default" | grep "metric")
+
+	# Count the number of routes.
+	route_count=$(echo "$routes" | grep -c "metric")
+
+	# Continue if there are less than two routes.
+	[ "$route_count" -lt 2 ] && continue
+
+	# Extract interfaces from default routes.
+	interfaces=$(echo "$routes" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+
+	for IFACE in $interfaces; do
+		# Continue if interface is a backup subflow.
+		ip mp e | grep -q "dev $IFACE" | grep -q "backup" && continue
+
+		# Run fping to get the average RTT of an interface.
+		OUTPUT=$(fping -q -t "$TIMEOUT_MS" -c "$COUNT" -I "$IFACE" "$SERVER_IP" 2>&1)
+		# Make the interface a backup subflow if there's no connectivity and continue.
+		[ "$?" -ne 0 ] && { bsbf-mptcp-helper backup "$IFACE" ; continue; }
+
+		eval RTT_$IFACE=$(echo "$OUTPUT" | awk -F'/' '{print $8}')
+	done
+
+	# Unset min/max RTT variables to clear values from previous loop.
+	unset min_rtt max_rtt min_iface max_iface
+
+	# Find the interfaces with the highest and lowest RTT. If the highest
+	# RTT exceeds the lowest RTT by more than the given threshold, make the
+	# higher-RTT interface a backup endpoint.
+	for IFACE in $interfaces; do
+		eval "rtt=\$RTT_$IFACE"
+
+		# Continue if RTT_$IFACE is empty.
+		[ -z "$rtt" ] && continue
+
+		if [ -z "$min_rtt" ]; then
+			min_rtt="$rtt"; min_iface="$IFACE"
+			max_rtt="$rtt"; max_iface="$IFACE"
+		else
+			less=$(awk 'BEGIN{print ('"$rtt"' < '"$min_rtt"') ? 1 : 0}')
+			[ "$less" -eq 1 ] && { min_rtt="$rtt"; min_iface="$IFACE"; }
+
+			greater=$(awk 'BEGIN{print ('"$rtt"' > '"$max_rtt"') ? 1 : 0}')
+			[ "$greater" -eq 1 ] && { max_rtt="$rtt"; max_iface="$IFACE"; }
+		fi
+	done
+
+	# Continue if there's no populated RTT_$IFACE.
+	[ -z "$min_rtt" ] || [ -z "$max_rtt" ] && continue
+
+	# Percentage difference = ((max - min) / min) * 100
+	pct_diff=$(awk 'BEGIN{max='"$max_rtt"'; min='"$min_rtt"'; printf "%.2f", (max-min)/min*100}')
+
+	# If difference exceeds threshold, mark the higher-RTT interface as backup.
+	backup=$(awk 'BEGIN{print ('"$pct_diff"' > '"$THRESHOLD_PERCENT"') ? 1 : 0}')
+
+	[ "$backup" -eq 1 ] && bsbf-mptcp-helper backup "$max_iface"
+done
