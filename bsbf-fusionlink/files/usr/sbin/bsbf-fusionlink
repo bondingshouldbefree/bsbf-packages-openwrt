@@ -5,7 +5,7 @@
 TIMEOUT_MS=900
 COUNT=3
 SERVER_IP=8.8.8.8
-INTERVAL=0.3
+INTERVAL=1
 
 until fping -q -t "$TIMEOUT_MS" -c "$COUNT" "$SERVER_IP"; do
 	sleep "$INTERVAL"
